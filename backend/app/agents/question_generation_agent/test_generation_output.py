@@ -50,6 +50,12 @@ for index, question in enumerate(questions, start=1):
         print("\nEXPECTED ANSWER:")
         print(question.get("expected_answer"))
 
+    if question.get("question_type") == "coding":
+        print("\nSCHEMA SQL:")
+        print(question.get("schema_sql", "MISSING"))
+
+        print("\nTEST DATA SQL:")
+        print(question.get("test_data_sql", "MISSING"))
     print("\nEXPLANATION:")
     print(question.get("explanation"))
 

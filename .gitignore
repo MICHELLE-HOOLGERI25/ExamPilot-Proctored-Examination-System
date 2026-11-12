@@ -13,3 +13,34 @@ __pycache__/
 .vscode/
 # Python virtual environment
 .venv/
+
+
+# Secrets and user databases
+.env
+.env.*
+!.env.example
+.auth_secret
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Local backups
+*.bak
+*_backup.*
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Frontend
+node_modules/
+dist/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/

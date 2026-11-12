@@ -25,10 +25,11 @@
 #             )
 
 #         self.client = genai.Client(api_key=api_key)
-#         self.model = "gemini-3.8-flash"
+#         self.model = "gemini-3.6-flash"
 
 #     def run(self, state: AgentState) -> Dict[str, Any]:
 #         requirements = state.get("requirements", {})
+
 
 #         subject = requirements.get("subject")
 #         topic = requirements.get("topic")
@@ -532,15 +533,20 @@ class QuestionGenerationAgent:
             if subject.upper() == "DBMS":
 
                 coding_instruction = """
-For coding questions:
+For DBMS coding questions:
 
-- Create scenario-based SQL problems.
-- Provide the database scenario.
-- Provide relevant table definitions.
-- Ask the student to write the SQL query.
-- Do NOT provide SQL code in the question.
-- Include the expected SQL solution separately.
-- These are NOT MCQs.
+- Generate a realistic, scenario-based SQL programming problem.
+- Include the table names, columns, and data types in the question statement.
+- Ask the student to write an SQL query; do not reveal the solution in the question.
+- Generate a complete schema_sql string containing SQLite-compatible CREATE TABLE statements.
+- Generate a test_data_sql string containing SQLite-compatible INSERT statements with enough sample records to test the query.
+- Generate expected_answer containing one correct, read-only SQL SELECT query.
+- Ensure schema_sql and test_data_sql work together without errors.
+- Ensure expected_answer returns meaningful results using the provided test data.
+- Use only SQLite-compatible SQL syntax.
+- Do not use INSERT, UPDATE, DELETE, DROP, or other write operations in expected_answer.
+- Keep schema_sql, test_data_sql, and expected_answer separate from the student-facing question.
+- These are coding questions, not MCQs.
 """
 
             elif subject.upper() == "OOPS":
@@ -635,16 +641,18 @@ Return this exact JSON structure:
 For coding questions use:
 
 {{
-    "question": "Scenario and task",
-    "question_type": "coding",
-    "options": {{}},
-    "correct_answer": null,
-    "expected_answer": "Expected SQL or code solution",
-    "explanation": "Explanation",
-    "subject": "{subject}",
-    "topic": "{topic_text}",
-    "difficulty": "{difficulty}",
-    "source": "gemini"
+"question": "Scenario and task",
+"question_type": "coding",
+"options": {{}},
+"correct_answer": null,
+"expected_answer": "Expected SQL or code solution",
+"schema_sql": "CREATE TABLE Students (id INTEGER, name TEXT, score INTEGER);",
+"test_data_sql": "INSERT INTO Students VALUES (1, 'Asha', 90);",
+"explanation": "Explanation",
+"subject": "{subject}",
+"topic": "{topic_text}",
+"difficulty": "{difficulty}",
+"source": "gemini"
 }}
 """
 

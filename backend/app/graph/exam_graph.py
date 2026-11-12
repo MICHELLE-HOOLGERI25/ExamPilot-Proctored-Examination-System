@@ -30,6 +30,9 @@ from backend.app.schemas.exam_session import (
 )
 
 
+from backend.app.agents.evaluation_agent.sql_grader import grade_sql_answer
+
+
 # ============================================================
 # AGENTS
 # ============================================================
@@ -750,30 +753,310 @@ def submit_exam_node(state: AgentState) -> dict:
 
 def evaluation_node(state: AgentState) -> dict:
     """
-    Integration point for Friend 4 evaluation.
+    Evaluate submitted MCQ and scenario-MCQ answers.
 
-    Friend 4 will receive:
-    - original questions
-    - student answers
-    - exam session information
+    Uses trusted questions from AgentState["questions"] and answers
+    associated with question_id. Does not trust student-facing question
+    data for answer keys.
     """
+
+    import json
+    from datetime import datetime, timezone
+
+    trace = list(state.get("trace", []))
+    session = state.get("exam_session") or {}
+
+    # Evaluation must only happen after the exam is submitted.
+    if not isinstance(session, dict):
+        session = (
+            session.model_dump(mode="json")
+            if hasattr(session, "model_dump")
+            else {}
+        )
+
+    session_status = session.get("status", "")
+    if hasattr(session_status, "value"):
+        session_status = session_status.value
+
+    if str(session_status).lower() != ExamSessionStatus.SUBMITTED.value:
+        message = (
+            "Evaluation rejected: the exam session must be submitted first."
+        )
+        return {
+            "current_stage": "error",
+            "current_agent": "evaluation_agent",
+            "last_error": message,
+            "errors": list(state.get("errors", [])) + [message],
+            "trace": trace + [{
+                "agent": "evaluation_agent",
+                "action": "evaluation_rejected",
+                "reason": "session_not_submitted",
+            }],
+        }
+
+    questions = state.get("questions") or []
+    answers = state.get("answers") or []
+
+    if not questions:
+        message = "Evaluation failed: no trusted questions were supplied."
+        return {
+            "current_stage": "error",
+            "current_agent": "evaluation_agent",
+            "last_error": message,
+            "errors": list(state.get("errors", [])) + [message],
+            "trace": trace + [{
+                "agent": "evaluation_agent",
+                "action": "evaluation_failed",
+                "reason": "no_questions",
+            }],
+        }
+
+    def normalize(value):
+        """Normalize simple answer labels or text for comparison."""
+        if value is None:
+            return ""
+        return " ".join(str(value).strip().casefold().split())
+
+    # Accept the list representation used by AgentState.
+    # Also tolerate a dictionary representation keyed by question ID.
+    if isinstance(answers, dict):
+        answer_items = []
+        for question_id, value in answers.items():
+            if hasattr(value, "model_dump"):
+                value = value.model_dump()
+            if isinstance(value, dict):
+                answer_items.append({
+                    **value,
+                    "question_id": value.get("question_id", question_id),
+                })
+            else:
+                answer_items.append({
+                    "question_id": question_id,
+                    "answer": value,
+                })
+    else:
+        answer_items = answers
+
+    submitted_by_id = {}
+    for item in answer_items:
+        if not isinstance(item, dict):
+            continue
+        question_id = item.get("question_id")
+        if question_id:
+            submitted_by_id[str(question_id)] = item.get(
+                "answer",
+                item.get("submitted_answer", ""),
+            )
+
+    results = []
+    total_marks = 0.0
+    marks_awarded = 0.0
+    correct_count = 0
+    answered_count = 0
+
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+
+        question_id = str(question.get("question_id", question.get("id", "")))
+        if not question_id:
+            continue
+
+        question_type = str(
+            question.get("question_type", question.get("type", ""))
+        ).strip().lower()
+
+        submitted_answer = submitted_by_id.get(question_id, "")
+        is_answered = bool(normalize(submitted_answer))
+
+        try:
+            marks = float(question.get("marks", question.get("points", 1)))
+        except (TypeError, ValueError):
+            marks = 1.0
+
+        if marks < 0:
+            marks = 0.0
+
+        total_marks += marks
+
+        correct_answer = question.get("correct_answer")
+        explanation = question.get("explanation", "")
+
+        # Initial version: objective MCQ and scenario-MCQ grading only.
+        is_mcq = (
+            "mcq" in question_type
+            or question_type in {"multiple_choice", "multiple-choice"}
+        )
+
+        if not is_answered:
+            correct = False
+            awarded = 0.0
+            feedback = (
+                "No answer submitted. No marks awarded."
+            )
+        elif not is_mcq:
+            # Automatically grade SQL coding questions.
+            is_sql_coding = (
+                question_type == "coding"
+                and bool(question.get("expected_answer"))
+                and bool(question.get("schema_sql"))
+            )
+
+            if is_sql_coding:
+                try:
+                    grading = grade_sql_answer(
+                        student_sql=str(submitted_answer),
+                        expected_sql=str(question["expected_answer"]),
+                        schema_sql=str(question["schema_sql"]),
+                        test_data_sql=str(
+                            question.get("test_data_sql", "")
+                        ),
+                        marks=marks,
+                    )
+
+                    awarded = float(
+                        grading.get("marks_awarded", 0.0)
+                    )
+                    awarded = max(0.0, min(awarded, marks))
+
+                    correct = (
+                        grading.get("status") == "correct"
+                        or (marks > 0 and awarded >= marks)
+                    )
+
+                    feedback = grading.get(
+                        "feedback",
+                        "SQL evaluation completed.",
+                    )
+
+                    if explanation:
+                        feedback += f" {explanation}"
+
+                except Exception as exc:
+                    correct = None
+                    awarded = 0.0
+                    feedback = (
+                        "SQL evaluation failed; manual review is required. "
+                        f"Details: {exc}"
+                    )
+            else:
+                correct = None
+                awarded = 0.0
+                feedback = (
+                    "Pending manual review: automatic grading is "
+                    "not implemented for this question type."
+                )
+        elif correct_answer is None:
+            correct = None
+            awarded = 0.0
+            feedback = (
+                "No trusted answer key is available; this question "
+                "requires review."
+            )
+        else:
+            options = question.get("options") or {}
+
+            submitted_normalized = normalize(submitted_answer)
+            correct_normalized = normalize(correct_answer)
+
+            # Accept either the option label (e.g. "A")
+            # or the option text (e.g. "SELECT").
+            accepted_answers = {correct_normalized}
+
+            if isinstance(options, dict):
+                correct_option_text = options.get(str(correct_answer).strip())
+                if correct_option_text is not None:
+                    accepted_answers.add(normalize(correct_option_text))
+
+                # Also support answer keys that contain option text
+                # instead of the option label.
+                for option_label, option_text in options.items():
+                    if normalize(option_text) == correct_normalized:
+                        accepted_answers.add(normalize(option_label))
+
+            correct = submitted_normalized in accepted_answers
+            awarded = marks if correct else 0.0
+
+            if correct:
+                feedback = "Correct answer."
+            else:
+                feedback = "Incorrect answer."
+
+            if explanation:
+                feedback += f" {explanation}"
+        if is_answered:
+            answered_count += 1
+
+        if correct is True:
+            correct_count += 1
+
+        marks_awarded += awarded
+
+        results.append({
+            "question_id": question_id,
+            "question_type": question_type,
+            "submitted_answer": submitted_answer,
+            "correct": correct,
+            "marks_awarded": round(awarded, 2),
+            "total_marks": round(marks, 2),
+            "feedback": feedback,
+        })
+
+    if not results:
+        message = (
+            "Evaluation failed: no evaluable question records were found."
+        )
+        return {
+            "current_stage": "error",
+            "current_agent": "evaluation_agent",
+            "last_error": message,
+            "errors": list(state.get("errors", [])) + [message],
+            "trace": trace + [{
+                "agent": "evaluation_agent",
+                "action": "evaluation_failed",
+                "reason": "no_valid_question_records",
+            }],
+        }
+
+    percentage = (
+        round((marks_awarded / total_marks) * 100, 2)
+        if total_marks > 0
+        else 0.0
+    )
+
+    evaluation_id = (
+        f"EVAL-{session.get('session_id', 'UNKNOWN')}"
+    )
+
+    evaluation = {
+        "evaluation_id": evaluation_id,
+        "exam_session_id": session.get("session_id"),
+        "student_id": session.get("student_id"),
+        "status": "completed",
+        "results": results,
+        "total_questions": len(results),
+        "answered_questions": answered_count,
+        "correct_answers": correct_count,
+        "total_marks": round(total_marks, 2),
+        "marks_awarded": round(marks_awarded, 2),
+        "percentage": percentage,
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
     return {
         "current_stage": "evaluation",
         "current_agent": "evaluation_agent",
-        "trace": state.get("trace", [])
-        + [
-            {
-                "agent": "evaluation_agent",
-                "action": "evaluation_stage",
-                "question_count": len(
-                    state.get("questions", [])
-                ),
-                "answer_count": len(
-                    state.get("answers", [])
-                ),
-            }
-        ],
+        "evaluation_results": results,
+        "final_result": evaluation,
+        "trace": trace + [{
+            "agent": "evaluation_agent",
+            "action": "evaluation_completed",
+            "question_count": len(results),
+            "answer_count": answered_count,
+            "marks_awarded": round(marks_awarded, 2),
+            "total_marks": round(total_marks, 2),
+            "percentage": percentage,
+        }],
     }
 
 
@@ -800,14 +1083,15 @@ def error_handler_node(state: AgentState) -> dict:
 # ============================================================
 
 def completed_node(state: AgentState) -> dict:
-    """Finish workflow successfully."""
+    """Finish workflow while preserving evaluation results."""
+
+    final_result = dict(state.get("final_result") or {})
+    final_result.setdefault("status", "completed")
 
     return {
         "current_stage": "completed",
         "current_agent": "coordinator",
-        "final_result": {
-            "status": "completed",
-        },
+        "final_result": final_result,
         "trace": state.get("trace", [])
         + [
             {
@@ -816,7 +1100,6 @@ def completed_node(state: AgentState) -> dict:
             }
         ],
     }
-
 
 def error_node(state: AgentState) -> dict:
     """Finish workflow after unrecoverable error."""
@@ -1193,9 +1476,17 @@ def build_exam_graph():
     # FRIEND 4 — EVALUATION
     # ========================================================
 
-    graph.add_edge(
-        "evaluation",
-        "reason_and_plan",
+    graph.add_conditional_edges(
+    "evaluation",
+    lambda state: (
+    "error_handler"
+    if state.get("current_stage") == "error"
+    else "reason_and_plan"
+    ),
+    {
+    "error_handler": "error_handler",
+    "reason_and_plan": "reason_and_plan",
+    },
     )
 
     # ========================================================
