@@ -44,3 +44,6 @@ frontend/dist/
 # IDE
 .vscode/
 .idea/
+
+# Uploaded professor notes
+/backend/app/uploads/

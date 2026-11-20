@@ -61,6 +61,13 @@ class ExamSessionAgent:
             ends_at=now + timedelta(minutes=duration_minutes),
             submitted_at=None,
             current_question_index=0,
+
+            question_ids=[
+              str(q["question_id"])
+              for q in questions
+              if q.get("question_id")
+            ],
+
             answers={},
             total_questions=len(questions),
             answered_questions=0,

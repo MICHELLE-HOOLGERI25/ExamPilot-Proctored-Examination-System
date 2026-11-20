@@ -3,6 +3,7 @@ from typing_extensions import TypedDict
 
 
 class AgentState(TypedDict, total=False):
+
     run_id: str
 
     # Student identity
@@ -21,27 +22,29 @@ class AgentState(TypedDict, total=False):
     current_agent: str
 
     # Question-related data
-    # Original validated questions are kept here.
-    # These may contain answer keys for downstream evaluation.
+    # Original questions, including answer keys
     questions: List[Dict[str, Any]]
 
-    # Student-facing questions.
-    # Sensitive fields such as correct_answer,
-    # expected_answer, explanation, source and metadata
-    # are removed before storing here.
+    # Student-facing questions without sensitive fields
     student_questions: List[Dict[str, Any]]
 
-    # Student answers already stored in the exam session.
-    answers: List[Dict[str, Any]]
+    # Professor notes retrieval
+    retrieved_context: str
+    retrieved_chunks: List[Dict[str, Any]]
 
-    # Answers waiting to be submitted by the student.
-    pending_answers: List[Dict[str, Any]]
-
-    # Request to submit/lock the current exam session.
-    submit_exam: bool
+    # Question source verification
+    grounding_results: List[Dict[str, Any]]
 
     # Validation information
     validation_results: List[Dict[str, Any]]
+    validation_status: str
+
+    # Student answers
+    answers: List[Dict[str, Any]]
+    pending_answers: List[Dict[str, Any]]
+
+    # Exam submission
+    submit_exam: bool
 
     # Evaluation information
     evaluation_results: List[Dict[str, Any]]

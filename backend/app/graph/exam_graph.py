@@ -132,38 +132,85 @@ def question_generation_agent_node(
 # ============================================================
 
 def validation_agent_node(state: AgentState) -> dict:
-    """Run the Validation Agent on retrieved/generated questions."""
+    """Run the Validation Agent and preserve detailed errors."""
 
     result = validation_agent.run(state)
 
     trace = state.get("trace", [])
+    action = result.get("action", {})
+    status = action.get("status", "failed")
+
+    errors = list(state.get("errors", []))
+    last_error = state.get("last_error")
+
+    validation_results = result.get(
+        "validation_results",
+        [],
+    )
+
+    if status != "passed":
+
+        detailed_errors = []
+
+        # Collect individual question validation errors.
+        for item in validation_results:
+            question_index = item.get("question_index")
+            question_errors = item.get("errors", [])
+
+            for error in question_errors:
+                detailed_errors.append(
+                    f"Question {question_index}: {error}"
+                )
+
+        # Collect question distribution errors.
+        for error in action.get("mix_errors", []):
+            detailed_errors.append(
+                f"Question distribution: {error}"
+            )
+
+        # Collect question count errors.
+        for error in action.get("count_errors", []):
+            detailed_errors.append(
+                f"Question count: {error}"
+            )
+
+        # Preserve a general validation failure message.
+        errors.append(
+            "Question validation failed. Exam generation stopped."
+        )
+
+        # Preserve the actual reasons.
+        errors.extend(detailed_errors)
+
+        last_error = (
+            "; ".join(detailed_errors)
+            if detailed_errors
+            else "Question validation failed. "
+                 "No detailed validation errors were returned."
+        )
 
     return {
         "current_agent": result.get(
             "current_agent",
             "validation_agent",
         ),
-        "action": result.get("action", {}),
-        "questions": result.get(
-            "questions",
-            state.get("questions", []),
-        ),
-        "validation_results": result.get(
-            "validation_results",
-            [],
-        ),
-        "trace": trace
-        + [
+        "action": action,
+        "questions": result.get("questions", []),
+        "validation_results": validation_results,
+        "validation_status": status,
+        "errors": errors,
+        "last_error": last_error,
+        "trace": trace + [
             result.get(
                 "trace_entry",
                 {
                     "agent": "validation_agent",
                     "action": "validate_questions",
+                    "status": status,
                 },
             )
         ],
     }
-
 
 # ============================================================
 # FRIEND 3 — EXAM SESSION
@@ -778,7 +825,13 @@ def evaluation_node(state: AgentState) -> dict:
     if hasattr(session_status, "value"):
         session_status = session_status.value
 
-    if str(session_status).lower() != ExamSessionStatus.SUBMITTED.value:
+    # Allow automatic timeout evaluation for expired sessions as well as
+    # normal student-submitted sessions. The timeout worker marks sessions
+    # EXPIRED before invoking evaluation.
+    if str(session_status).lower() not in {
+        ExamSessionStatus.SUBMITTED.value,
+        ExamSessionStatus.EXPIRED.value,
+    }:
         message = (
             "Evaluation rejected: the exam session must be submitted first."
         )
@@ -1140,14 +1193,16 @@ def route_after_coordinator(
 ]:
     """Route according to Coordinator decision."""
 
-    # Explicit session actions take priority over the coordinator's
-    # normal stage decision. This allows a caller to submit answers
-    # or submit the exam through the same LangGraph entry point.
+    # Explicit session actions take priority.
     if state.get("pending_answers"):
         return "answer_submission"
 
     if state.get("submit_exam") is True:
         return "submit_exam"
+
+    # Notes-only exam generation starts directly from professor notes.
+    if state.get("requirements", {}).get("notes_only", False):
+        return "question_generation"
 
     stage = state.get("current_stage")
 
@@ -1163,7 +1218,6 @@ def route_after_coordinator(
         return stage
 
     return "error"
-
 
 # ============================================================
 # REVISION ROUTING
@@ -1197,11 +1251,14 @@ def route_after_revision(
 
 def route_after_error(
     state: AgentState,
-) -> Literal[
-    "reason_and_plan",
-    "error",
-]:
-    """Decide whether workflow should retry."""
+) -> Literal["reason_and_plan", "error"]:
+
+    requirements = state.get("requirements", {})
+
+    # Notes-only generation must fail closed.
+    # Never retry through the legacy agentic/OpenClaw workflow.
+    if requirements.get("notes_only", False):
+        return "error"
 
     result = should_retry(state)
 
@@ -1220,13 +1277,29 @@ def route_after_question_retrieval(
 ) -> Literal[
     "validation",
     "question_generation",
+    "error_handler",
 ]:
-    """Decide whether retrieved questions satisfy the teacher's exact mix."""
+    """Route questions based on retrieval results."""
 
     requirements = state.get("requirements", {})
-    question_mix = requirements.get("question_mix")
-
     existing_questions = state.get("questions", [])
+
+    # STRICT PROFESSOR-NOTES-ONLY MODE
+    if requirements.get("notes_only", False):
+
+        retrieved_chunks = state.get("retrieved_chunks", [])
+        retrieved_context = state.get("retrieved_context", "")
+
+        if not retrieved_chunks or not retrieved_context.strip():
+            return "error_handler"
+
+        if state.get("errors", []):
+            return "error_handler"
+
+        return "question_generation"
+
+    # LEGACY QUESTION-BANK MODE
+    question_mix = requirements.get("question_mix")
 
     if question_mix:
         question_type_counts = {
@@ -1242,10 +1315,8 @@ def route_after_question_retrieval(
                 question_type_counts[question_type] += 1
 
         mix_satisfied = all(
-            question_type_counts[question_type]
-            >= int(required_count)
-            for question_type, required_count
-            in question_mix.items()
+            question_type_counts[question_type] >= int(required_count)
+            for question_type, required_count in question_mix.items()
         )
 
         if mix_satisfied:
@@ -1255,10 +1326,7 @@ def route_after_question_retrieval(
 
     required_count = requirements.get(
         "count",
-        requirements.get(
-            "number_of_questions",
-            5,
-        ),
+        requirements.get("number_of_questions", 5),
     )
 
     if len(existing_questions) >= required_count:
@@ -1266,6 +1334,38 @@ def route_after_question_retrieval(
 
     return "question_generation"
 
+# ============================================================
+# VALIDATION ROUTING
+# ============================================================
+
+def route_after_validation(
+    state: AgentState,
+) -> Literal["exam_session", "error_handler"]:
+
+    status = state.get("validation_status", "failed")
+
+    if status != "passed":
+        return "error_handler"
+
+    return "exam_session"
+
+def route_after_exam_session(
+    state: AgentState,
+) -> Literal["completed", "reason_and_plan", "error_handler"]:
+    """
+    Route successful notes-only exam creation directly to completion.
+    Preserve the existing agentic workflow for other session operations.
+    """
+
+    if state.get("current_stage") == "error":
+        return "error_handler"
+
+    requirements = state.get("requirements", {})
+
+    if requirements.get("notes_only", False):
+        return "completed"
+
+    return "reason_and_plan"
 
 # ============================================================
 # BUILD EXAM GRAPH
@@ -1438,8 +1538,9 @@ def build_exam_graph():
         "mcp_retrieval",
         route_after_question_retrieval,
         {
-            "validation": "validation",
-            "question_generation": "question_generation_agent",
+             "validation": "validation",
+             "question_generation": "question_generation_agent",
+             "error_handler": "error_handler",
         },
     )
 
@@ -1448,18 +1549,27 @@ def build_exam_graph():
         "validation",
     )
 
-    graph.add_edge(
+    graph.add_conditional_edges(
         "validation",
-        "reason_and_plan",
+        route_after_validation,
+        {
+            "exam_session": "exam_session",
+            "error_handler": "error_handler",
+        },
     )
 
     # ========================================================
     # FRIEND 3 — SESSION
     # ========================================================
 
-    graph.add_edge(
+    graph.add_conditional_edges(
         "exam_session",
-        "reason_and_plan",
+        route_after_exam_session,
+        {
+            "completed": "completed",
+            "reason_and_plan": "reason_and_plan",
+            "error_handler": "error_handler",
+        },
     )
 
     graph.add_edge(
@@ -1567,7 +1677,6 @@ exam_graph = build_exam_graph()
 # ============================================================
 # INITIAL AGENT STATE
 # ============================================================
-
 def create_exam_state(exam_request) -> AgentState:
     """Convert an ExamRequest into the initial AgentState."""
 
@@ -1575,24 +1684,20 @@ def create_exam_state(exam_request) -> AgentState:
 
     if exam_request.question_mix:
         question_mix = {
-            "normal_mcq": (
-                exam_request.question_mix.normal_mcq
-            ),
-            "scenario_mcq": (
-                exam_request.question_mix.scenario_mcq
-            ),
-            "coding": (
-                exam_request.question_mix.coding
-            ),
+            "normal_mcq": exam_request.question_mix.normal_mcq,
+            "scenario_mcq": exam_request.question_mix.scenario_mcq,
+            "coding": exam_request.question_mix.coding,
         }
 
     requirements = {
         "subject": exam_request.subject,
         "topic": exam_request.topic,
         "difficulty": exam_request.difficulty,
-        "number_of_questions": (
-            exam_request.number_of_questions
-        ),
+        "number_of_questions": exam_request.number_of_questions,
+
+        # Notes-based generation
+        "document_ids": exam_request.document_ids,
+        "notes_only": True,
     }
 
     if question_mix:
@@ -1603,9 +1708,11 @@ def create_exam_state(exam_request) -> AgentState:
         "student": exam_request.student.model_dump(),
         "exam_id": None,
         "exam_session": {},
-        "goal": "Generate examination questions",
+        "goal": "Generate examination questions strictly from professor notes",
         "requirements": requirements,
         "questions": [],
+        "retrieved_context": "",
+        "retrieved_chunks": [],
         "student_questions": [],
         "answers": [],
         "pending_answers": [],
