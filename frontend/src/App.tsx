@@ -1,8 +1,18 @@
-import { FormEvent, useEffect, useState } from "react";
+import * as React from "react";
+
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   Activity,
   ArrowRight,
   BookOpen,
+  Eye,
+  EyeOff,
   BrainCircuit,
   CheckCircle2,
   Clock3,
@@ -18,9 +28,11 @@ import {
   Users,
   Upload,
   Trash2,
+  AlertTriangle,
 } from "lucide-react";
 
 import "./App.css";
+import ExamCamera, { type ExamCameraHandle } from "./ExamCamera";
 
 // ============================================================
 // CONFIGURATION
@@ -45,6 +57,7 @@ type User = {
 
 type Exam = {
   session_id: string;
+  assignment_id?: string;
   status?: string;
   total_questions?: number;
   answered_questions?: number;
@@ -54,6 +67,8 @@ type Exam = {
   scheduled_start_at?: string | null;
   scheduled_end_at?: string | null;
   duration_minutes?: number;
+  started_at?: string | null;
+  ends_at?: string | null;
 };
 
 type Note = {
@@ -150,6 +165,8 @@ export default function App() {
 
   const [mode, setMode] = useState<"login" | "register">("login");
 
+  const [showPassword, setShowPassword] = useState(false);
+
   const [busy, setBusy] = useState(false);
 
   const [message, setMessage] = useState("");
@@ -159,12 +176,70 @@ export default function App() {
   // ==========================================================
 
   const [view, setView] = useState<
-    "home" | "create" | "exam" | "result"
+    "home" | "create" | "student-results" | "consent" | "prepare" | "exam" | "result"
   >("home");
+
+  const [pendingExam, setPendingExam] = useState<Exam | null>(null);
+  const [examConsent, setExamConsent] = useState(false);
+  const [previewReady, setPreviewReady] = useState(false);
+  const previewStreamRef = useRef<MediaStream | null>(null);
+  const previewVideoRef = useRef<HTMLVideoElement>(null);
+
+  function releasePreviewStream() {
+    previewStreamRef.current?.getTracks().forEach(track => track.stop());
+    previewStreamRef.current = null;
+    setPreviewReady(false);
+  }
+
+  useEffect(() => {
+    if (view !== "prepare" || !previewVideoRef.current || !previewStreamRef.current) return;
+    const element = previewVideoRef.current;
+    element.srcObject = previewStreamRef.current;
+    void element.play().catch(error => console.warn("Preview playback:", error));
+  }, [view, previewReady]);
+  const [recordingActive, setRecordingActive] = useState(false);
+  const examCameraRef = useRef<ExamCameraHandle | null>(null);
+  const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
+  const timeoutHandledRef = useRef(false);
 
   const [exams, setExams] = useState<Exam[]>([]);
 
   const [active, setActive] = useState<Exam | null>(null);
+
+  // ========================================
+  // PROCTORING STATE
+  // ========================================
+
+  const [examFullscreen, setExamFullscreen] = useState(false);
+
+  const [securityViolations, setSecurityViolations] = useState(0);
+
+  const [securityNotice, setSecurityNotice] = useState("");
+
+  // Prevent events after the backend ends the examination.
+  const examClosedRef = useRef(false);
+
+  // Prevent rapidly repeated events of the same type.
+  const lastSecurityEventsRef = useRef<Record<string, number>>({});
+
+  // Keep track of answer requests still being saved.
+  const pendingAnswerSavesRef = useRef<Promise<void>>(
+    Promise.resolve()
+  );
+
+  // Pending debounce timers, one per question.
+  const answerSaveTimersRef = useRef<
+    Record<string, ReturnType<typeof setTimeout>>
+  >({});
+
+  // Latest unsent text for each question.
+  const answerDraftsRef = useRef<Record<string, string>>({});
+
+  // Prevent double submission.
+  const submittingRef = useRef(false);
+
+  // Identifies this browser's active examination client.
+  const examClientRef = useRef<string>("");
 
   const [answers, setAnswers] = useState<
     Record<string, string>
@@ -173,6 +248,27 @@ export default function App() {
   const [result, setResult] = useState<any>(null);
 
   const [teacherResults, setTeacherResults] = useState<any[]>([]);
+  const [selectedResultDivision, setSelectedResultDivision] = useState("");
+
+  const [expandedWarningSession, setExpandedWarningSession] =
+    useState<string | null>(null);
+
+
+  const [recordingViewer, setRecordingViewer] = useState<{
+    sessionId: string;
+    url: string;
+  } | null>(null);
+
+  const [recordingLoading, setRecordingLoading] =
+    useState<string | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (recordingViewer?.url) {
+        URL.revokeObjectURL(recordingViewer.url);
+      }
+    };
+  }, [recordingViewer?.url]);
 
   // ==========================================================
   // PROFESSOR NOTES
@@ -191,6 +287,592 @@ export default function App() {
   const [selectedDocuments, setSelectedDocuments] = useState<
     string[]
   >([]);
+
+
+  // ==========================================================
+  // PROCTORING MONITORING - SHARED EVENT HANDLER
+  // ==========================================================
+
+  const recordSecurityEvent = useCallback(
+    async (eventType: string, warning: string) => {
+      if (
+        view !== "exam" ||
+        !active?.session_id ||
+        examClosedRef.current
+      ) {
+        return;
+      }
+
+      const sessionId = active.session_id;
+      const now = Date.now();
+
+      // Avoid repeated identical browser callbacks.
+      const previous =
+        lastSecurityEventsRef.current[eventType] || 0;
+
+      if (now - previous < 1000) return;
+
+      lastSecurityEventsRef.current[eventType] = now;
+      setSecurityNotice(warning);
+
+      try {
+        const data = await req(
+          `/api/exams/${encodeURIComponent(sessionId)}/proctoring/events`,
+          token,
+          {
+            method: "POST",
+            headers: {
+              "X-Exam-Client": examClientRef.current,
+            },
+            body: JSON.stringify({
+              event_type: eventType,
+              details: { message: warning },
+            }),
+          }
+        );
+
+        if (examClosedRef.current) return;
+
+        setSecurityViolations(data.incident_count);
+        setSecurityNotice(data.warning_message);
+
+        // The backend has ended the examination.
+        if (data.exam_terminated) {
+          examClosedRef.current = true;
+
+          setSecurityNotice(
+            "Exam terminated. Finishing recording upload..."
+          );
+
+          const recordingSaved =
+            await examCameraRef.current?.finishRecording();
+
+          setResult({
+            ...(data.termination_result || {}),
+            exam_terminated: true,
+          });
+
+          setExamFullscreen(false);
+          setView("result");
+
+          setMessage(
+            recordingSaved === true
+              ? "⛔ Exam terminated. Recording uploaded successfully."
+              : "⛔ Exam terminated. Complete recording upload was not confirmed."
+          );
+
+          if (document.fullscreenElement) {
+            try {
+              await document.exitFullscreen();
+            } catch (error) {
+              console.warn(
+                "Could not exit fullscreen:",
+                error
+              );
+            }
+          }
+        }
+
+      } catch (error: any) {
+        if (examClosedRef.current) return;
+
+        const errorText = String(
+          error?.message || error
+        );
+
+        console.error(
+          "Proctoring request failed:",
+          error
+        );
+
+        // An earlier event may already have ended
+        // the attempt. Confirm its current status.
+        if (
+          errorText.includes(
+            "This examination has already ended"
+          )
+        ) {
+          try {
+            const exam = await req(
+              `/api/exams/${encodeURIComponent(sessionId)}`,
+              token
+            );
+
+            if (
+              exam.status !== "in_progress" &&
+              !examClosedRef.current
+            ) {
+              examClosedRef.current = true;
+
+              let savedResult: any = {
+                evaluation_pending: true,
+              };
+
+              try {
+                savedResult = await req(
+                  `/api/exams/${encodeURIComponent(sessionId)}/results`,
+                  token
+                );
+              } catch (resultError) {
+                console.warn(
+                  "Results not yet available:",
+                  resultError
+                );
+              }
+
+              setResult({
+                ...savedResult,
+                exam_terminated: Boolean(
+                  exam.proctoring_terminated
+                ),
+              });
+
+              setExamFullscreen(false);
+              setView("result");
+
+              setMessage(
+                "The examination has ended."
+              );
+
+              if (document.fullscreenElement) {
+                await document.exitFullscreen()
+                  .catch(console.warn);
+              }
+
+              return;
+            }
+          } catch (statusError) {
+            console.error(
+              "Could not check examination status:",
+              statusError
+            );
+          }
+        }
+
+        if (!examClosedRef.current) {
+          setSecurityNotice(
+            `Security event could not be recorded: ${errorText}`
+          );
+        }
+      }
+    },
+    [view, active?.session_id, token]
+  );
+
+  // Fullscreen and tab visibility monitoring.
+  useEffect(() => {
+    if (view !== "exam" || !active?.session_id) return;
+
+    function handleFullscreenChange() {
+      if (examClosedRef.current) return;
+
+      const fullscreen =
+        Boolean(document.fullscreenElement);
+
+      if (!fullscreen && examFullscreen) {
+        setExamFullscreen(false);
+
+        void recordSecurityEvent(
+          "fullscreen_exit",
+          "Fullscreen exited! Please return to fullscreen."
+        );
+      }
+    }
+
+    function handleVisibilityChange() {
+      if (examClosedRef.current) return;
+
+      if (document.visibilityState === "hidden") {
+        void recordSecurityEvent(
+          "tab_switch",
+          "Tab switching detected during examination!"
+        );
+      }
+    }
+
+    document.addEventListener(
+      "fullscreenchange",
+      handleFullscreenChange
+    );
+
+    document.addEventListener(
+      "visibilitychange",
+      handleVisibilityChange
+    );
+
+    return () => {
+      document.removeEventListener(
+        "fullscreenchange",
+        handleFullscreenChange
+      );
+
+      document.removeEventListener(
+        "visibilitychange",
+        handleVisibilityChange
+      );
+    };
+  }, [
+    view,
+    active?.session_id,
+    examFullscreen,
+    recordSecurityEvent,
+  ]);
+
+  // The actual server attempt begins only after the student clicks Start.
+  async function enterExamFullscreen() {
+    if (
+      view !== "prepare" || !pendingExam || !examConsent ||
+      !previewReady || busy ||
+      !previewStreamRef.current?.getVideoTracks().some(t => t.readyState === "live") ||
+      !previewStreamRef.current?.getAudioTracks().some(t => t.readyState === "live")
+    ) {
+      setMessage("⚠ Consent and a working camera/microphone are required.");
+      return;
+    }
+
+    try {
+      // This must be called directly from the click to satisfy browser rules.
+      await document.documentElement.requestFullscreen();
+      const started = await openExam(pendingExam);
+      if (!started && document.fullscreenElement) {
+        await document.exitFullscreen().catch(console.warn);
+      }
+    } catch (error: any) {
+      setMessage(`⚠ Could not start in fullscreen: ${error?.message || error}`);
+    }
+  }
+
+  // Copy, paste, right-click and focus monitoring.
+  useEffect(() => {
+    if (view !== "exam" || !active?.session_id) return;
+
+    function handleCopy(event: ClipboardEvent) {
+      if (
+        examClosedRef.current ||
+        !document.fullscreenElement
+      ) return;
+
+      event.preventDefault();
+
+      void recordSecurityEvent(
+        "copy_attempt",
+        "Copying is not allowed during the examination."
+      );
+    }
+
+    function handlePaste(event: ClipboardEvent) {
+      if (
+        examClosedRef.current ||
+        !document.fullscreenElement
+      ) return;
+
+      event.preventDefault();
+
+      void recordSecurityEvent(
+        "paste_attempt",
+        "Pasting is not allowed during the examination."
+      );
+    }
+
+    function handleContextMenu(event: MouseEvent) {
+      if (
+        examClosedRef.current ||
+        !document.fullscreenElement
+      ) return;
+
+      event.preventDefault();
+
+      void recordSecurityEvent(
+        "context_menu",
+        "Right-click is disabled during the examination."
+      );
+    }
+
+    function handleWindowBlur() {
+      if (
+        examClosedRef.current ||
+        !document.fullscreenElement ||
+        document.visibilityState !== "visible"
+      ) return;
+
+      void recordSecurityEvent(
+        "window_blur",
+        "Examination window lost focus."
+      );
+    }
+
+    document.addEventListener("copy", handleCopy);
+    document.addEventListener("paste", handlePaste);
+    document.addEventListener(
+      "contextmenu",
+      handleContextMenu
+    );
+    window.addEventListener("blur", handleWindowBlur);
+
+    return () => {
+      document.removeEventListener("copy", handleCopy);
+      document.removeEventListener("paste", handlePaste);
+      document.removeEventListener(
+        "contextmenu",
+        handleContextMenu
+      );
+      window.removeEventListener(
+        "blur",
+        handleWindowBlur
+      );
+    };
+  }, [
+    view,
+    active?.session_id,
+    recordSecurityEvent,
+  ]);
+
+
+
+
+  // ==========================================================
+  // EXAM COUNTDOWN AND AUTOMATIC TIMEOUT
+  // ==========================================================
+
+  useEffect(() => {
+    if (
+      view !== "exam" ||
+      !active?.session_id ||
+      !active.ends_at
+    ) {
+      return;
+    }
+
+    const sessionId = active.session_id;
+    const deadline = new Date(active.ends_at).getTime();
+
+    if (!Number.isFinite(deadline)) {
+      setMessage("⚠ Invalid examination deadline.");
+      return;
+    }
+
+    let cancelled = false;
+
+    async function handleTimeout() {
+      if (
+        cancelled ||
+        timeoutHandledRef.current ||
+        examClosedRef.current ||
+        submittingRef.current
+      ) {
+        return;
+      }
+
+      timeoutHandledRef.current = true;
+      submittingRef.current = true;
+
+      // Do not send late answers.
+      for (const timer of Object.values(
+        answerSaveTimersRef.current
+      )) {
+        clearTimeout(timer);
+      }
+
+      answerSaveTimersRef.current = {};
+      answerDraftsRef.current = {};
+
+      setRemainingSeconds(0);
+      setMessage("⏰ Time is over. Finalizing your examination...");
+
+      try {
+        const recordingSaved =
+          await examCameraRef.current?.finishRecording();
+
+        if (cancelled) return;
+        const data = await req(
+          `/api/exams/${encodeURIComponent(sessionId)}/submit`,
+          token,
+          {
+            method: "POST",
+            headers: {
+              "X-Exam-Client": examClientRef.current,
+            },
+            body: "{}",
+          }
+        );
+
+        if (cancelled) return;
+
+        examClosedRef.current = true;
+        setResult(data);
+        setMessage(
+          recordingSaved === true
+            ? "⏰ Time is over. Exam submitted and recording uploaded."
+            : "⚠ Time is over. Exam submitted, but complete recording upload was not confirmed."
+        );
+        setExamFullscreen(false);
+        setView("result");
+
+        if (document.fullscreenElement) {
+          await document.exitFullscreen().catch(console.warn);
+        }
+
+        void load().catch(console.error);
+      } catch (error: any) {
+        if (cancelled) return;
+
+        // The submission may have already been finalized.
+        try {
+          const current = await req(
+            `/api/exams/${encodeURIComponent(sessionId)}`,
+            token
+          );
+
+          if (cancelled) return;
+
+          if (current.status !== "in_progress") {
+            examClosedRef.current = true;
+
+            try {
+              const saved = await req(
+                `/api/exams/${encodeURIComponent(sessionId)}/results`,
+                token
+              );
+              if (!cancelled) setResult(saved);
+            } catch {
+              if (!cancelled) {
+                setResult({ evaluation_pending: true });
+              }
+            }
+
+            if (!cancelled) {
+              setMessage("⏰ Examination has ended.");
+              setExamFullscreen(false);
+              setView("result");
+            }
+
+            if (document.fullscreenElement) {
+              await document.exitFullscreen().catch(console.warn);
+            }
+            return;
+          }
+        } catch (statusError) {
+          console.error("Could not confirm exam status:", statusError);
+        }
+
+        if (!cancelled) {
+          setMessage(
+            `⚠ Time is over, but automatic submission could not be confirmed: ${error?.message || error
+            }`
+          );
+          timeoutHandledRef.current = false;
+        }
+      } finally {
+        submittingRef.current = false;
+      }
+    }
+
+    function updateCountdown() {
+      if (cancelled || examClosedRef.current) return;
+
+      const seconds = Math.max(
+        0,
+        Math.ceil((deadline - Date.now()) / 1000)
+      );
+
+      setRemainingSeconds(seconds);
+
+      if (seconds === 0) {
+        void handleTimeout();
+      }
+    }
+
+    updateCountdown();
+
+    const interval = window.setInterval(updateCountdown, 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [view, active?.session_id, active?.ends_at, token]);
+
+
+  // ==========================================================
+  // EXAM SESSION HEARTBEAT
+  // ==========================================================
+
+  useEffect(() => {
+    if (
+      view !== "exam" ||
+      !active?.session_id ||
+      !examClientRef.current
+    ) return;
+
+    const sessionId = active.session_id;
+    const clientId = examClientRef.current;
+
+    let stopped = false;
+    let running = false;
+
+    async function heartbeat() {
+      if (stopped || running || examClosedRef.current) {
+        return;
+      }
+
+      running = true;
+
+      try {
+        await req(
+          `/api/exams/${encodeURIComponent(sessionId)}/client/heartbeat`,
+          token,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              client_id: clientId,
+            }),
+          }
+        );
+      } catch (error: any) {
+        if (stopped || examClosedRef.current) return;
+
+        const reason = String(error?.message || error);
+
+        if (
+          reason.includes("already ended") ||
+          reason.includes("another browser session") ||
+          reason.includes("another session")
+        ) {
+          examClosedRef.current = true;
+
+          setExamFullscreen(false);
+          setView("home");
+          setMessage(
+            "Examination ended or opened in another session."
+          );
+
+          if (document.fullscreenElement) {
+            void document.exitFullscreen().catch(console.warn);
+          }
+
+          return;
+        }
+
+        // Network failures are not cheating violations.
+        setSecurityNotice(
+          "Connection interrupted. Attempting to reconnect."
+        );
+      } finally {
+        running = false;
+      }
+    }
+
+    const interval = window.setInterval(
+      () => void heartbeat(),
+      15000
+    );
+
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+    };
+  }, [view, active?.session_id, token]);
+
 
   // ==========================================================
   // AUTH FORM
@@ -222,13 +904,13 @@ export default function App() {
   });
 
   // ==========================================================
-// EXAM SCHEDULING
-// ==========================================================
+  // EXAM SCHEDULING
+  // ==========================================================
 
-const [durationMinutes, setDurationMinutes] = useState(30);
-const [scheduledDate, setScheduledDate] = useState("");
-const [startTime, setStartTime] = useState("");
-const [endTime, setEndTime] = useState("");
+  const [durationMinutes, setDurationMinutes] = useState(30);
+  const [scheduledDate, setScheduledDate] = useState("");
+  const [startTime, setStartTime] = useState("");
+  const [endTime, setEndTime] = useState("");
 
   const teacher = user?.role === "teacher";
 
@@ -293,6 +975,66 @@ const [endTime, setEndTime] = useState("");
       await loadNotes();
     }
   }
+
+
+  async function watchRecording(sessionId: string) {
+    if (recordingLoading) return;
+
+    // Click again to close the current recording.
+    if (recordingViewer?.sessionId === sessionId) {
+      setRecordingViewer(null);
+      return;
+    }
+
+    setRecordingLoading(sessionId);
+    setMessage("");
+
+    try {
+      const response = await fetch(
+        `${API}/api/teacher/exams/${encodeURIComponent(sessionId)}/recording-video`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      if (!response.ok) {
+        const body = await response.text();
+
+        if (response.status === 404) {
+          throw new Error(
+            "No recording has been uploaded for this attempt."
+          );
+        }
+
+        throw new Error(
+          `Could not load recording (${response.status}): ${body}`
+        );
+      }
+
+      const blob = await response.blob();
+
+      if (blob.size === 0) {
+        throw new Error("Recording file is empty.");
+      }
+
+      const url = URL.createObjectURL(blob);
+
+      setRecordingViewer({
+        sessionId,
+        url,
+      });
+    } catch (error: any) {
+      setMessage(
+        `⚠ ${error?.message || "Could not load recording"}`
+      );
+    } finally {
+      setRecordingLoading(null);
+    }
+  }
+
 
   // ==========================================================
   // INITIALIZE AUTHENTICATED SESSION
@@ -418,8 +1160,7 @@ const [endTime, setEndTime] = useState("");
             } catch (e: any) {
               if (!cancelled) {
                 setMessage(
-                  `Could not load professor notes: ${
-                    e.message || e
+                  `Could not load professor notes: ${e.message || e
                   }`
                 );
               }
@@ -434,8 +1175,7 @@ const [endTime, setEndTime] = useState("");
           setExams([]);
 
           setMessage(
-            `Login succeeded, but exams could not be loaded: ${
-              e.message || e
+            `Login succeeded, but exams could not be loaded: ${e.message || e
             }`
           );
         }
@@ -462,35 +1202,35 @@ const [endTime, setEndTime] = useState("");
     setMessage("");
 
     // Validate optional exam schedule.
-if (
-  scheduledDate ||
-  startTime ||
-  endTime
-) {
-  if (!scheduledDate || !startTime || !endTime) {
-    setMessage(
-      "⚠ Please provide the date, start time and end time together."
-    );
-    return;
-  }
+    if (
+      scheduledDate ||
+      startTime ||
+      endTime
+    ) {
+      if (!scheduledDate || !startTime || !endTime) {
+        setMessage(
+          "⚠ Please provide the date, start time and end time together."
+        );
+        return;
+      }
 
-  const start = new Date(`${scheduledDate}T${startTime}`);
-  const end = new Date(`${scheduledDate}T${endTime}`);
+      const start = new Date(`${scheduledDate}T${startTime}`);
+      const end = new Date(`${scheduledDate}T${endTime}`);
 
-  if (end <= start) {
-    setMessage(
-      "⚠ End time must be later than start time."
-    );
-    return;
-  }
+      if (end <= start) {
+        setMessage(
+          "⚠ End time must be later than start time."
+        );
+        return;
+      }
 
-  if (start <= new Date()) {
-    setMessage(
-      "⚠ Scheduled start time must be in the future."
-    );
-    return;
-  }
-}
+      if (start <= new Date()) {
+        setMessage(
+          "⚠ Scheduled start time must be in the future."
+        );
+        return;
+      }
+    }
 
     try {
 
@@ -569,6 +1309,10 @@ if (
   // ==========================================================
 
   function logout() {
+    releasePreviewStream();
+
+    setMessage("");
+    setShowPassword(false);
 
     localStorage.removeItem("oce_token");
     localStorage.removeItem("oce_user");
@@ -825,15 +1569,15 @@ if (
         scheduled_start_at:
           scheduledDate && startTime
             ? new Date(
-                `${scheduledDate}T${startTime}`
-              ).toISOString()
+              `${scheduledDate}T${startTime}`
+            ).toISOString()
             : null,
 
         scheduled_end_at:
           scheduledDate && endTime
             ? new Date(
-                `${scheduledDate}T${endTime}`
-              ).toISOString()
+              `${scheduledDate}T${endTime}`
+            ).toISOString()
             : null,
 
         // Notes-only integration
@@ -884,16 +1628,24 @@ if (
   // OPEN STUDENT EXAM
   // ==========================================================
 
-  async function openExam(x: Exam) {
+  async function openExam(x: Exam): Promise<boolean> {
 
     setBusy(true);
     setMessage("");
 
     try {
 
+      if (!examConsent || !document.fullscreenElement) {
+        throw new Error("Consent and fullscreen are required before starting.");
+      }
+
       const d = await req(
-        `/api/exams/${encodeURIComponent(x.session_id)}`,
-        token
+        `/api/exams/${encodeURIComponent(x.assignment_id || x.session_id)}/start`,
+        token,
+        {
+          method: "POST",
+          body: JSON.stringify({ consent_accepted: true }),
+        }
       );
 
       if (!d.session_id) {
@@ -902,6 +1654,78 @@ if (
         );
       }
 
+      if (d.status !== "in_progress") {
+        setMessage(
+          "This examination has already ended and cannot be reopened."
+        );
+        setView("prepare");
+        return false;
+      }
+
+
+      // Register this browser with the backend.
+      const clientKey = `exampilot_client_${d.session_id}`;
+
+      let clientId = sessionStorage.getItem(clientKey);
+
+      if (!clientId) {
+        clientId = crypto.randomUUID();
+        sessionStorage.setItem(clientKey, clientId);
+      }
+
+      await req(
+        `/api/exams/${encodeURIComponent(d.session_id)}/client/claim`,
+        token,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            client_id: clientId,
+          }),
+        }
+      );
+
+      examClientRef.current = clientId;
+
+
+      examClosedRef.current = false;
+      lastSecurityEventsRef.current = {};
+      pendingAnswerSavesRef.current = Promise.resolve();
+
+      for (
+        const timer of Object.values(
+          answerSaveTimersRef.current
+        )
+      ) {
+        clearTimeout(timer);
+      }
+
+      answerSaveTimersRef.current = {};
+      answerDraftsRef.current = {};
+      submittingRef.current = false;
+
+
+
+      setExamFullscreen(Boolean(document.fullscreenElement));
+      setSecurityViolations(0);
+      setSecurityNotice("");
+
+      timeoutHandledRef.current = false;
+      setRecordingActive(false);
+
+      const deadline = d.ends_at
+        ? new Date(d.ends_at).getTime()
+        : NaN;
+
+      if (!Number.isFinite(deadline)) {
+        throw new Error(
+          "The backend did not provide a valid exam deadline."
+        );
+      }
+
+      setRemainingSeconds(
+        Math.max(0, Math.ceil((deadline - Date.now()) / 1000))
+      );
+
       setActive(d);
 
       setAnswers({});
@@ -909,82 +1733,237 @@ if (
       setResult(null);
 
       setView("exam");
+      return true;
 
     } catch (e: any) {
-
       fail(e);
-
+      return false;
     } finally {
-
       setBusy(false);
     }
   }
+
+
+  // ==========================================================
+  // SAVE ANSWER DURING EXAMINATION
+  // ==========================================================
+
+
+
+  function saveAnswerImmediately(
+    questionId: string,
+    answer: string
+  ): void {
+    if (
+      !active?.session_id ||
+      examClosedRef.current ||
+      submittingRef.current
+    ) return;
+
+    const sessionId = active.session_id;
+
+    // Keep only the latest unsent answer.
+    answerDraftsRef.current[questionId] = answer;
+
+    // Cancel the previous timer for this question.
+    const oldTimer =
+      answerSaveTimersRef.current[questionId];
+
+    if (oldTimer !== undefined) {
+      clearTimeout(oldTimer);
+    }
+
+    answerSaveTimersRef.current[questionId] =
+      setTimeout(() => {
+        delete answerSaveTimersRef.current[questionId];
+
+        const latest =
+          answerDraftsRef.current[questionId];
+
+        delete answerDraftsRef.current[questionId];
+
+        if (
+          latest === undefined ||
+          examClosedRef.current ||
+          submittingRef.current
+        ) return;
+
+        // Queue this save after previous saves.
+        const save = pendingAnswerSavesRef.current
+          .catch(() => undefined)
+          .then(async () => {
+            if (
+              examClosedRef.current ||
+              submittingRef.current
+            ) return;
+
+            await req(
+              `/api/exams/${encodeURIComponent(sessionId)}/answers`,
+              token,
+              {
+                method: "POST",
+                headers: {
+                  "X-Exam-Client": examClientRef.current,
+                },
+                body: JSON.stringify({
+                  question_id: questionId,
+                  answer: latest,
+                }),
+              }
+            );
+          });
+
+        pendingAnswerSavesRef.current = save;
+
+        void save.catch((error) => {
+          if (examClosedRef.current) return;
+
+          console.error(
+            "Answer autosave failed:",
+            error
+          );
+
+          setMessage(
+            "⚠ An answer could not be autosaved. Please check your connection."
+          );
+        });
+      }, 700);
+  }
+
+
 
   // ==========================================================
   // SUBMIT STUDENT EXAM
   // ==========================================================
 
-  async function submit() {
 
-    if (!active) return;
+
+  async function submit() {
+    if (
+      !active ||
+      busy ||
+      examClosedRef.current ||
+      submittingRef.current
+    ) return;
+
+    submittingRef.current = true;
+
+    const sessionId = active.session_id;
 
     setBusy(true);
+    setMessage("");
 
     try {
+      // Stop all pending debounce timers.
+      for (
+        const timer of Object.values(
+          answerSaveTimersRef.current
+        )
+      ) {
+        clearTimeout(timer);
+      }
 
+      answerSaveTimersRef.current = {};
+      answerDraftsRef.current = {};
+
+      // Allow previously started requests to finish.
+      // Final answers will be sent again below.
+      await pendingAnswerSavesRef.current
+        .catch((error) => {
+          console.warn(
+            "Earlier autosave failed:",
+            error
+          );
+        });
+
+      if (examClosedRef.current) return;
+
+      // Save the latest displayed answer for every question.
       for (
         let i = 0;
         i < (active.questions || []).length;
         i++
       ) {
+        if (examClosedRef.current) return;
 
-        const id = qid(active.questions[i], i);
+        const id = qid(
+          (active.questions || [])[i],
+          i
+        );
 
-        if (answers[id] !== undefined) {
+        if (answers[id] === undefined) continue;
 
-          await req(
-            `/api/exams/${active.session_id}/answers`,
-            token,
-            {
-              method: "POST",
-
-              body: JSON.stringify({
-                question_id: id,
-                answer: answers[id],
-              }),
-            }
-          );
-        }
+        await req(
+          `/api/exams/${encodeURIComponent(sessionId)}/answers`,
+          token,
+          {
+            method: "POST",
+            headers: {
+              "X-Exam-Client": examClientRef.current,
+            },
+            body: JSON.stringify({
+              question_id: id,
+              answer: answers[id],
+            }),
+          }
+        );
       }
 
-      const d = await req(
-        `/api/exams/${active.session_id}/submit`,
+      if (examClosedRef.current) return;
+
+      setMessage("Finishing recording and uploading final video...");
+
+      const recordingSaved =
+        await examCameraRef.current?.finishRecording();
+
+      // Use the existing manual submission endpoint.
+      const data = await req(
+        `/api/exams/${encodeURIComponent(sessionId)}/submit`,
         token,
         {
           method: "POST",
+          headers: {
+            "X-Exam-Client": examClientRef.current,
+          },
           body: "{}",
         }
       );
 
-      setResult(d);
+      examClosedRef.current = true;
 
+      setResult(data);
+      setExamFullscreen(false);
       setView("result");
 
       setMessage(
-        "Submission sent to evaluation."
+        recordingSaved === true
+          ? "✓ Examination submitted. Recording uploaded successfully."
+          : "⚠ Examination submitted, but complete recording upload was not confirmed."
       );
+      if (document.fullscreenElement) {
+        await document.exitFullscreen().catch(
+          (error) =>
+            console.warn(
+              "Fullscreen exit failed:",
+              error
+            )
+        );
+      }
 
       await load();
 
-    } catch (e: any) {
-
-      fail(e);
+    } catch (error: any) {
+      if (!examClosedRef.current) {
+        fail(error);
+      }
 
     } finally {
-
+      submittingRef.current = false;
       setBusy(false);
     }
   }
+
+
 
   // ==========================================================
   // AUTHENTICATION SCREEN
@@ -1063,7 +2042,7 @@ if (
           </div>
 
           <small className="hero-foot">
-            ONLINE COURSE EXAMINATION SYSTEM · FRIEND 4
+            ONLINE COURSE EXAMINATION SYSTEM
           </small>
 
         </section>
@@ -1077,13 +2056,11 @@ if (
               : "Already registered?"}
 
             <button
-              onClick={() =>
-                setMode(
-                  mode === "login"
-                    ? "register"
-                    : "login"
-                )
-              }
+              onClick={() => {
+                setMode(mode === "login" ? "register" : "login");
+                setShowPassword(false);
+                setMessage("");
+              }}
             >
               {mode === "login"
                 ? "Create account"
@@ -1239,22 +2216,38 @@ if (
                 />
               </label>
 
-              <label>
-                Password
 
-                <input
-                  required
-                  type="password"
-                  minLength={8}
-                  value={a.password}
-                  onChange={(e) =>
-                    setA({
-                      ...a,
-                      password: e.target.value,
-                    })
-                  }
-                />
-              </label>
+              <div className="auth-password-group">
+                <label htmlFor="auth-password">Password</label>
+
+                <div className="auth-password-field">
+                  <input
+                    id="auth-password"
+                    required
+                    type={showPassword ? "text" : "password"}
+                    minLength={8}
+                    value={a.password}
+                    onChange={(e) =>
+                      setA({
+                        ...a,
+                        password: e.target.value,
+                      })
+                    }
+                  />
+
+                  <button
+                    type="button"
+                    className="auth-password-toggle"
+                    onClick={() => setShowPassword((previous) => !previous)}
+                    aria-label={showPassword ? "Hide password" : "Show password"}
+                    aria-pressed={showPassword}
+                    title={showPassword ? "Hide password" : "Show password"}
+                  >
+                    {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                  </button>
+                </div>
+              </div>
+
 
               <button
                 className="primary full"
@@ -1316,27 +2309,48 @@ if (
               ? "nav active"
               : "nav"
           }
-          onClick={() => setView("home")}
+          onClick={() => {
+            if (view === "prepare") releasePreviewStream();
+            setView("home");
+          }}
         >
           <LayoutDashboard size={18} />
           Overview
         </button>
 
-        {teacher && (
 
-          <button
-            className={
-              view === "create"
-                ? "nav active"
-                : "nav"
-            }
-            onClick={() => setView("create")}
-          >
-            <Plus size={18} />
-            Create exam
-          </button>
+        {teacher && (
+          <>
+            <button
+              className={
+                view === "create"
+                  ? "nav active"
+                  : "nav"
+              }
+              onClick={() => setView("create")}
+            >
+              <Plus size={18} />
+              Create exam
+            </button>
+
+            <button
+              className={
+                view === "student-results"
+                  ? "nav active"
+                  : "nav"
+              }
+              onClick={() => {
+                setView("student-results");
+                setMessage("");
+              }}
+            >
+              <GraduationCap size={18} />
+              Student results
+            </button>
+          </>
 
         )}
+
 
         <div className="side-bottom">
 
@@ -1386,15 +2400,20 @@ if (
             </small>
 
             <h1>
-              {view === "create"
-                ? "Create an examination"
-                : view === "exam"
-                  ? "Exam in progress"
-                  : view === "result"
-                    ? "Evaluation results"
-                    : `Good to see you, ${
-                        user.name.split(" ")[0]
-                      }`}
+              {view === "prepare"
+                ? "Camera check"
+                : view === "consent"
+                  ? "Examination consent"
+                  : view === "create"
+                    ? "Create an examination"
+                    : view === "student-results"
+                      ? "Student results"
+                      : view === "exam"
+                        ? "Exam in progress"
+                        : view === "result"
+                          ? "Evaluation results"
+                          : `Good to see you, ${user.name.split(" ")[0]
+                          }`}
             </h1>
 
           </div>
@@ -1517,11 +2536,11 @@ if (
                 <small>In progress</small>
 
                 <b>
-                  {
-                    exams.filter((x) =>
-                      String(x.status).includes("progress")
+                  {teacher
+                    ? exams.filter(
+                      (x: any) => Number(x.in_progress_count || 0) > 0
                     ).length
-                  }
+                    : exams.filter((x) => x.status === "in_progress").length}
                 </b>
               </div>
 
@@ -1530,13 +2549,15 @@ if (
                 <small>Completed</small>
 
                 <b>
-                  {
-                    exams.filter((x) =>
-                      /submitted|completed|evaluated/i.test(
+                  {teacher
+                    ? exams.filter(
+                      (x: any) => x.schedule_closed === true
+                    ).length
+                    : exams.filter((x) =>
+                      /submitted|completed|evaluated|expired/i.test(
                         x.status || ""
                       )
-                    ).length
-                  }
+                    ).length}
                 </b>
               </div>
 
@@ -1607,11 +2628,10 @@ if (
 
                     <p>
                       {teacher
-                        ? `Assigned to Division ${
-                            (x as any).division ||
-                            (x as any).target_division ||
-                            "A"
-                          }`
+                        ? `Assigned to Division ${(x as any).division ||
+                        (x as any).target_division ||
+                        "A"
+                        }`
                         : "Complete this assessment and submit for evaluation."}
                     </p>
 
@@ -1631,7 +2651,7 @@ if (
 
                     </div>
 
-                                        {!teacher && (
+                    {!teacher && (
                       <div className="exam-schedule-info">
                         {x.scheduled_start_at && (
                           <p>
@@ -1664,7 +2684,14 @@ if (
                     {!teacher && (
                       <button
                         className="link-btn"
-                        onClick={() => openExam(x)}
+                        onClick={() => {
+                          setPendingExam(x);
+                          releasePreviewStream();
+                          setExamConsent(false);
+                          setRecordingActive(false);
+                          setMessage("");
+                          setView("consent");
+                        }}
                         disabled={
                           busy ||
                           /submitted|completed|evaluated|locked|expired|timeout/i.test(
@@ -1675,10 +2702,10 @@ if (
                         {/expired|timeout/i.test(x.status || "")
                           ? "Exam expired"
                           : /submitted|completed|evaluated|locked/i.test(
-                              x.status || ""
-                            )
-                          ? "Exam submitted"
-                          : "Attend exam"}
+                            x.status || ""
+                          )
+                            ? "Exam submitted"
+                            : "Attend exam"}
 
                         {!/submitted|completed|evaluated|locked|expired|timeout/i.test(
                           x.status || ""
@@ -1702,7 +2729,7 @@ if (
         {/* TEACHER RESULTS — ORIGINAL FRIEND 4 FUNCTIONALITY */}
         {/* ================================================== */}
 
-        {view === "home" && teacher && (
+        {view === "student-results" && teacher && (
 
           <section
             className="panel"
@@ -1755,200 +2782,405 @@ if (
                   )
                 ).sort();
 
+                const activeDivision = divisions.includes(selectedResultDivision)
+                  ? selectedResultDivision
+                  : divisions[0];
                 return (
 
-                  <div style={{ display: "grid", gap: 28 }}>
-
-                    {divisions.map((division: string) => {
-
-                      const divisionRows =
-                        teacherResults.filter(
-                          (r: any) =>
-                            String(r.division || "Unassigned") ===
-                            division
-                        );
-
-                      const examGroups = new Map<string, any[]>();
-
-                      divisionRows.forEach((r: any) => {
-
-                        const key = String(
-                          r.assignment_id ||
-                            `${r.subject || "Exam"}|${r.topic || ""}|${r.total_marks || ""}`
-                        );
-
-                        if (!examGroups.has(key)) {
-                          examGroups.set(key, []);
-                        }
-
-                        examGroups.get(key)!.push(r);
-
-                      });
-
-                      return (
-
-                        <section
+                  <div className="teacher-results-layout">
+                    <div className="teacher-division-tabs" role="tablist" aria-label="Choose division">
+                      {divisions.map((division) => (
+                        <button
                           key={division}
-                          style={{
-                            border: "1px solid #e8ebf4",
-                            borderRadius: 18,
-                            padding: 20,
-                            background: "#fafbff",
+                          type="button"
+                          role="tab"
+                          aria-selected={activeDivision === division}
+                          className={
+                            activeDivision === division
+                              ? "teacher-division-tab active"
+                              : "teacher-division-tab"
+                          }
+                          onClick={() => {
+                            setSelectedResultDivision(division);
+                            setExpandedWarningSession(null);
+                            setRecordingViewer(null);
                           }}
                         >
+                          <Users size={16} />
+                          {division === "Unassigned"
+                            ? "Unassigned"
+                            : `Division ${division}`}
 
-                          <div style={{ marginBottom: 18 }}>
-                            <small>DIVISION</small>
+                          <span>
+                            {teacherResults.filter(
+                              (r: any) =>
+                                String(r.division || "Unassigned") === division
+                            ).length}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
 
-                            <h2 style={{ margin: "4px 0 0" }}>
-                              Division {division}
-                            </h2>
-                          </div>
+                    {divisions
+                      .filter((division: string) => division === activeDivision)
+                      .map((division: string) => {
 
-                          <div style={{ display: "grid", gap: 20 }}>
+                        const divisionRows =
+                          teacherResults.filter(
+                            (r: any) =>
+                              String(r.division || "Unassigned") ===
+                              division
+                          );
 
-                            {Array.from(
-                              examGroups.entries()
-                            ).map(([examKey, rows]) => {
+                        const examGroups = new Map<string, any[]>();
 
-                              const first = rows[0] || {};
+                        divisionRows.forEach((r: any) => {
 
-                              const assignmentId =
-                                first.assignment_id;
+                          const key = String(
+                            r.assignment_id ||
+                            `${r.subject || "Exam"}|${r.topic || ""}|${r.total_marks || ""}`
+                          );
 
-                              const examIndex = assignmentId
-                                ? exams.findIndex(
+                          if (!examGroups.has(key)) {
+                            examGroups.set(key, []);
+                          }
+
+                          examGroups.get(key)!.push(r);
+
+                        });
+
+                        return (
+
+                          <section
+                            key={division}
+                            style={{
+                              border: "1px solid #e8ebf4",
+                              borderRadius: 18,
+                              padding: 20,
+                              background: "#fafbff",
+                            }}
+                          >
+
+                            <div style={{ marginBottom: 18 }}>
+                              <small>DIVISION</small>
+
+                              <h2 style={{ margin: "4px 0 0" }}>
+                                Division {division}
+                              </h2>
+                            </div>
+
+                            <div style={{ display: "grid", gap: 20 }}>
+
+                              {Array.from(
+                                examGroups.entries()
+                              ).map(([examKey, rows]) => {
+
+                                const first = rows[0] || {};
+
+                                const assignmentId =
+                                  first.assignment_id;
+
+                                const examIndex = assignmentId
+                                  ? exams.findIndex(
                                     (x: any) =>
                                       x.session_id === assignmentId
                                   )
-                                : -1;
+                                  : -1;
 
-                              const sessionLabel =
-                                examIndex >= 0
-                                  ? `Session ${String(
+                                const sessionLabel =
+                                  examIndex >= 0
+                                    ? `Session ${String(
                                       examIndex + 1
                                     ).padStart(2, "0")}`
-                                  : "Exam";
+                                    : "Exam";
 
-                              return (
+                                return (
 
-                                <div
-                                  key={examKey}
-                                  style={{
-                                    background: "#fff",
-                                    border: "1px solid #e8ebf4",
-                                    borderRadius: 16,
-                                    padding: 18,
-                                  }}
-                                >
-
-                                  <div
-                                    style={{
-                                      display: "flex",
-                                      justifyContent: "space-between",
-                                      gap: 16,
-                                      alignItems: "center",
-                                      flexWrap: "wrap",
-                                      marginBottom: 14,
-                                    }}
+                                  <details
+                                    key={examKey}
+                                    className="teacher-session-details"
                                   >
 
-                                    <div>
-                                      <small>{sessionLabel}</small>
+                                    <summary className="teacher-session-summary">
 
-                                      <h3 style={{ margin: "4px 0 0" }}>
-                                        {first.subject || "Exam"}
-                                        {first.topic
-                                          ? ` · ${first.topic}`
-                                          : ""}
-                                      </h3>
+                                      <div>
+                                        <small>{sessionLabel}</small>
+
+                                        <h3 style={{ margin: "4px 0 0" }}>
+                                          {first.subject || "Exam"}
+                                          {first.topic
+                                            ? ` · ${first.topic}`
+                                            : ""}
+                                        </h3>
+                                      </div>
+
+                                      <span className="pill">
+                                        {rows.length} submission
+                                        {rows.length === 1 ? "" : "s"}
+                                      </span>
+
+                                    </summary>
+
+                                    <div style={{ overflowX: "auto" }}>
+
+                                      <table
+                                        style={{
+                                          width: "100%",
+                                          borderCollapse: "collapse",
+                                          minWidth: 650,
+                                        }}
+                                      >
+
+                                        <thead>
+                                          <tr>
+                                            <th style={{ textAlign: "left", padding: 12 }}>Student</th>
+                                            <th style={{ textAlign: "left", padding: 12 }}>USN</th>
+                                            <th style={{ textAlign: "left", padding: 12 }}>Marks</th>
+                                            <th style={{ textAlign: "left", padding: 12 }}>Percentage</th>
+                                            <th style={{ textAlign: "left", padding: 12 }}>Status</th>
+                                            <th style={{ textAlign: "left", padding: 12 }}>
+                                              Warnings
+                                            </th>
+                                            <th style={{ textAlign: "left", padding: 12 }}>
+                                              Recording
+                                            </th>
+                                          </tr>
+                                        </thead>
+
+                                        <tbody>
+
+
+                                          {rows.map((r: any, i: number) => {
+                                            const sessionId = String(
+                                              r.session_id || i
+                                            );
+
+                                            const isExpanded =
+                                              expandedWarningSession === sessionId;
+
+                                            const warningCount =
+                                              Number(r.warning_count || 0);
+
+                                            const eventCount =
+                                              Number(r.security_event_count || 0);
+
+                                            const events = Array.isArray(r.proctoring_events)
+                                              ? r.proctoring_events
+                                              : [];
+
+                                            return (
+                                              <React.Fragment key={sessionId}>
+                                                <tr
+                                                  style={{
+                                                    borderTop: "1px solid #e8ebf4",
+                                                  }}
+                                                >
+                                                  <td style={{ padding: 12 }}>
+                                                    {r.student_name || r.name || "Student"}
+                                                  </td>
+
+                                                  <td style={{ padding: 12 }}>
+                                                    {r.student_usn || r.usn || "—"}
+                                                  </td>
+
+                                                  <td style={{ padding: 12 }}>
+                                                    <b>
+                                                      {r.marks ?? r.marks_awarded ?? 0}
+                                                      {" / "}
+                                                      {r.total_marks ?? 0}
+                                                    </b>
+                                                  </td>
+
+                                                  <td style={{ padding: 12 }}>
+                                                    <b>{r.percentage ?? 0}%</b>
+                                                  </td>
+
+                                                  <td style={{ padding: 12 }}>
+                                                    {r.proctoring_terminated
+                                                      ? "Terminated (security)"
+                                                      : r.status || "Completed"}
+                                                  </td>
+
+                                                  <td style={{ padding: 12 }}>
+                                                    <button
+                                                      type="button"
+                                                      className="secondary"
+                                                      aria-expanded={isExpanded}
+                                                      aria-label={`View warnings for ${r.student_name || "student"}`}
+                                                      onClick={() =>
+                                                        setExpandedWarningSession(
+                                                          isExpanded ? null : sessionId
+                                                        )
+                                                      }
+                                                      style={{
+                                                        display: "inline-flex",
+                                                        alignItems: "center",
+                                                        gap: 8,
+                                                      }}
+                                                    >
+                                                      <AlertTriangle
+                                                        size={16}
+                                                        color={
+                                                          warningCount > 0
+                                                            ? "#c2410c"
+                                                            : "#16a34a"
+                                                        }
+                                                      />
+                                                      {warningCount}
+                                                    </button>
+                                                  </td>
+
+                                                  <td style={{ padding: 12 }}>
+                                                    <button
+                                                      type="button"
+                                                      className="secondary"
+                                                      disabled={
+                                                        recordingLoading !== null
+                                                      }
+                                                      onClick={() =>
+                                                        void watchRecording(sessionId)
+                                                      }
+                                                    >
+                                                      {recordingLoading === sessionId
+                                                        ? "Loading..."
+                                                        : recordingViewer?.sessionId === sessionId
+                                                          ? "Close Recording"
+                                                          : "▶ Watch Recording"}
+                                                    </button>
+                                                  </td>
+                                                </tr>
+
+
+                                                {recordingViewer?.sessionId === sessionId && (
+                                                  <tr>
+                                                    <td
+                                                      colSpan={7}
+                                                      style={{
+                                                        padding: 18,
+                                                        background: "#f8fafc",
+                                                      }}
+                                                    >
+                                                      <h4>
+                                                        Student Examination Recording
+                                                      </h4>
+
+                                                      <video
+                                                        key={recordingViewer.url}
+                                                        src={recordingViewer.url}
+                                                        controls
+                                                        playsInline
+                                                        preload="metadata"
+                                                        style={{
+                                                          display: "block",
+                                                          width: "100%",
+                                                          maxWidth: 720,
+                                                          borderRadius: 12,
+                                                          background: "#111",
+                                                        }}
+                                                      />
+
+
+                                                    </td>
+                                                  </tr>
+                                                )}
+
+
+
+                                                {isExpanded && (
+                                                  <tr>
+                                                    <td
+                                                      colSpan={7}
+                                                      style={{
+                                                        padding: 16,
+                                                        background: "#fafbff",
+                                                      }}
+                                                    >
+                                                      <div className="proctor-card">
+                                                        <div className="proctor-card-header">
+                                                          <h4>Proctoring history</h4>
+                                                          <p>Security activity recorded during the examination.</p>
+                                                        </div>
+
+                                                        <div className="proctor-stats">
+                                                          <div className="proctor-stat">
+                                                            <span className="proctor-stat-label">Warnings</span>
+                                                            <strong>{warningCount} / 3</strong>
+                                                          </div>
+
+                                                          <div className="proctor-stat">
+                                                            <span className="proctor-stat-label">Incidents</span>
+                                                            <strong>{Number(r.incident_count ?? eventCount)}</strong>
+                                                          </div>
+
+                                                          <div className="proctor-stat">
+                                                            <span className="proctor-stat-label">Recorded events</span>
+                                                            <strong>{eventCount}</strong>
+                                                          </div>
+                                                        </div>
+
+                                                        {r.proctoring_terminated && (
+                                                          <div className="proctor-alert">
+                                                            Examination automatically terminated after reaching the security limit.
+                                                          </div>
+                                                        )}
+
+                                                        {events.length > 0 ? (
+                                                          <div className="proctor-event-list">
+                                                            {events.map((event: any, index: number) => (
+                                                              <div
+                                                                key={`${event.event_type}-${event.occurred_at ?? index}`}
+                                                                className="proctor-event-item"
+                                                              >
+                                                                <div className="proctor-event-top">
+                                                                  <span className="proctor-event-type">
+                                                                    {event.event_type?.replaceAll("_", " ")}
+                                                                  </span>
+                                                                  <span className="proctor-event-time">
+                                                                    {event.occurred_at
+                                                                      ? new Date(event.occurred_at).toLocaleString()
+                                                                      : "Time unavailable"}
+                                                                  </span>
+                                                                </div>
+
+                                                                <div className="proctor-event-message">
+                                                                  {event.message || event.detail || "Security event recorded during the examination."}
+                                                                </div>
+                                                              </div>
+                                                            ))}
+                                                          </div>
+                                                        ) : (
+                                                          <div className="proctor-empty">
+                                                            No proctoring events were recorded for this attempt.
+                                                          </div>
+                                                        )}
+                                                      </div>
+                                                    </td>
+                                                  </tr>
+                                                )}
+                                              </React.Fragment>
+                                            );
+                                          })}
+
+
+                                        </tbody>
+
+                                      </table>
+
                                     </div>
 
-                                    <span className="pill">
-                                      {rows.length} submission
-                                      {rows.length === 1 ? "" : "s"}
-                                    </span>
+                                  </details>
 
-                                  </div>
+                                );
 
-                                  <div style={{ overflowX: "auto" }}>
+                              })}
 
-                                    <table
-                                      style={{
-                                        width: "100%",
-                                        borderCollapse: "collapse",
-                                        minWidth: 650,
-                                      }}
-                                    >
+                            </div>
 
-                                      <thead>
-                                        <tr>
-                                          <th style={{ textAlign: "left", padding: 12 }}>Student</th>
-                                          <th style={{ textAlign: "left", padding: 12 }}>USN</th>
-                                          <th style={{ textAlign: "left", padding: 12 }}>Marks</th>
-                                          <th style={{ textAlign: "left", padding: 12 }}>Percentage</th>
-                                          <th style={{ textAlign: "left", padding: 12 }}>Status</th>
-                                        </tr>
-                                      </thead>
+                          </section>
 
-                                      <tbody>
+                        );
 
-                                        {rows.map((r: any, i: number) => (
-
-                                          <tr
-                                            key={r.session_id || i}
-                                            style={{
-                                              borderTop: "1px solid #e8ebf4",
-                                            }}
-                                          >
-
-                                            <td style={{ padding: 12 }}>
-                                              {r.student_name || r.name || "Student"}
-                                            </td>
-
-                                            <td style={{ padding: 12 }}>
-                                              {r.student_usn || r.usn || "—"}
-                                            </td>
-
-                                            <td style={{ padding: 12 }}>
-                                              <b>
-                                                {r.marks ?? r.marks_awarded ?? 0}
-                                                {" / "}
-                                                {r.total_marks ?? 0}
-                                              </b>
-                                            </td>
-
-                                            <td style={{ padding: 12 }}>
-                                              <b>{r.percentage ?? 0}%</b>
-                                            </td>
-
-                                            <td style={{ padding: 12 }}>
-                                              {r.status || "Completed"}
-                                            </td>
-
-                                          </tr>
-
-                                        ))}
-
-                                      </tbody>
-
-                                    </table>
-
-                                  </div>
-
-                                </div>
-
-                              );
-
-                            })}
-
-                          </div>
-
-                        </section>
-
-                      );
-
-                    })}
+                      })}
 
                   </div>
 
@@ -1995,7 +3227,7 @@ if (
             {/* PROFESSOR NOTES MANAGEMENT */}
             {/* ---------------------------------------------- */}
 
-            <section className="panel">
+            <section className="panel teacher-notes-panel">
 
               <div className="section-head">
 
@@ -2214,10 +3446,7 @@ if (
             {/* EXAM CONFIGURATION */}
             {/* ---------------------------------------------- */}
 
-            <section
-              className="panel"
-              style={{ marginTop: 24 }}
-            >
+            <section className="panel teacher-configuration-panel">
 
               <h2>Exam configuration</h2>
 
@@ -2225,6 +3454,26 @@ if (
                 Configure your examination using the uploaded
                 professor notes.
               </p>
+
+              <div className="teacher-form-guide">
+                <div>
+                  <span className="teacher-guide-number">01</span>
+                  <strong>Exam details</strong>
+                  <small>Division, subject and difficulty</small>
+                </div>
+
+                <div>
+                  <span className="teacher-guide-number">02</span>
+                  <strong>Question setup</strong>
+                  <small>Notes and question mix</small>
+                </div>
+
+                <div>
+                  <span className="teacher-guide-number">03</span>
+                  <strong>Schedule & generate</strong>
+                  <small>Review before creating</small>
+                </div>
+              </div>
 
               <form
                 onSubmit={create}
@@ -2324,7 +3573,7 @@ if (
                   (note) =>
                     note.processing_status === "processed" &&
                     note.subject.trim().toLowerCase() ===
-                      f.subject.trim().toLowerCase()
+                    f.subject.trim().toLowerCase()
                 ).length === 0 ? (
 
                   <div className="empty">
@@ -2349,21 +3598,17 @@ if (
                         (note) =>
                           note.processing_status === "processed" &&
                           note.subject.trim().toLowerCase() ===
-                            f.subject.trim().toLowerCase()
+                          f.subject.trim().toLowerCase()
                       )
                       .map((note) => (
 
                         <label
                           key={note.document_id}
-                          className="exam-card"
-                          style={{
-                            cursor: "pointer",
-                            border: selectedDocuments.includes(
-                              note.document_id
-                            )
-                              ? "2px solid #6c63d9"
-                              : undefined,
-                          }}
+                          className={
+                            selectedDocuments.includes(note.document_id)
+                              ? "exam-card teacher-note-choice selected"
+                              : "exam-card teacher-note-choice"
+                          }
                         >
 
                           <div
@@ -2411,7 +3656,7 @@ if (
 
                 )}
 
-                                <h3>04 · Question mix</h3>
+                <h3>04 · Question mix</h3>
 
                 <div className="mix">
                   {[
@@ -2438,6 +3683,19 @@ if (
                 </div>
 
                 <h3>05 · Exam schedule</h3>
+
+                <div className="teacher-schedule-help">
+                  <Clock3 size={20} />
+
+                  <div>
+                    <strong>Set when students can take this examination</strong>
+                    <p>
+                      Exam duration is the time each student receives
+                      after starting. The scheduled date and start/end
+                      times control when the exam is available.
+                    </p>
+                  </div>
+                </div>
 
                 <div className="grid three">
                   <label>
@@ -2490,28 +3748,97 @@ if (
                   </label>
                 </div>
 
-                <div className="form-end"></div>
+
 
                 <p>
                   Leave the schedule fields empty to make the exam
                   available immediately.
                 </p>
 
-                {/* ADD EXAM SCHEDULE HERE */}
-                {/* <h3>05 · Exam schedule</h3> */}
 
-                {/* Paste the complete scheduling block here */}
 
-                {/* Existing form-end section */}
-                <div className="form-end"></div>
+                <div className="teacher-exam-review">
+                  <div className="teacher-review-heading">
+                    <div>
+                      <h3>Review your examination</h3>
+                      <p>
+                        Confirm these settings before generating questions.
+                      </p>
+                    </div>
+                    <CheckCircle2 size={22} />
+                  </div>
+
+                  <div className="teacher-review-grid">
+                    <div>
+                      <small>Target division</small>
+                      <strong>Division {f.division || "Not selected"}</strong>
+                    </div>
+
+                    <div>
+                      <small>Subject & topic</small>
+                      <strong>{f.subject} · {f.topic || "No topic"}</strong>
+                    </div>
+
+                    <div>
+                      <small>Difficulty</small>
+                      <strong>
+                        {f.difficulty === "L1"
+                          ? "Easy"
+                          : f.difficulty === "L2"
+                            ? "Medium"
+                            : "Hard"}
+                      </strong>
+                    </div>
+
+                    <div>
+                      <small>Question distribution</small>
+                      <strong>
+                        {f.normal} MCQ · {f.scenario} Scenario · {f.coding} Coding
+                      </strong>
+                    </div>
+
+                    <div>
+                      <small>Selected documents</small>
+                      <strong>{selectedDocuments.length} selected</strong>
+                    </div>
+
+                    <div>
+                      <small>Exam duration</small>
+                      <strong>{durationMinutes} minutes</strong>
+                    </div>
+
+                    <div className="teacher-review-wide">
+                      <small>Availability</small>
+                      <strong>
+                        {scheduledDate && startTime && endTime
+                          ? `${scheduledDate} · ${startTime} – ${endTime}`
+                          : scheduledDate || startTime || endTime
+                            ? "Schedule incomplete"
+                            : "Available immediately"}
+                      </strong>
+                    </div>
+                  </div>
+                </div>
 
                 <div className="form-end">
 
                   <span>
 
                     <b>
-                      {f.normal + f.scenario + f.coding} questions selected
+                      {f.normal + f.scenario + f.coding} of {f.count} questions configured
                     </b>
+
+                    <div
+                      className={
+                        f.normal + f.scenario + f.coding === f.count
+                          ? "teacher-form-validation valid"
+                          : "teacher-form-validation invalid"
+                      }
+                    >
+                      {f.normal + f.scenario + f.coding === f.count
+                        ? "✓ Question distribution is valid"
+                        : "⚠ The question types must add up to the total"}
+                    </div>
 
                     <small>
                       Selected documents: {selectedDocuments.length}
@@ -2547,123 +3874,407 @@ if (
 
         )}
 
+
+        {view === "consent" && pendingExam && (
+          <section className="panel student-consent">
+            <h2>Examination Consent</h2>
+            <p className="student-intro">
+              Before starting, please review the examination
+              monitoring requirements.
+            </p>
+
+            <div className="student-stepper">
+              <span className="step-current">1 · Consent</span>
+              <span>2 · Camera check</span>
+              <span>3 · Examination</span>
+            </div>
+
+            <div className="student-info-box">
+              <div className="student-info-heading">
+                <ShieldCheck size={20} />
+                <strong>Secure examination monitoring</strong>
+              </div>
+
+              <p>
+                Your webcam and microphone will be recorded only
+                after you start the examination.
+              </p>
+              <p>
+                The recording is uploaded to ExamPilot and is
+                accessible to the authorized examiner.
+              </p>
+            </div>
+
+            <label className="student-consent-choice"
+            >
+              <input
+                type="checkbox"
+                checked={examConsent}
+                onChange={(e) =>
+                  setExamConsent(e.target.checked)
+                }
+              />
+
+              <span>
+                I consent to webcam and microphone recording
+                throughout this examination.
+              </span>
+            </label>
+
+            <div className="student-actions">
+              <button
+                className="primary"
+                type="button"
+                disabled={!examConsent || busy}
+                onClick={async () => {
+                  if (!examConsent || !pendingExam || busy) return;
+                  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+                    setMessage("⚠ This browser cannot record camera and microphone.");
+                    return;
+                  }
+                  setBusy(true);
+                  setMessage("");
+                  try {
+                    releasePreviewStream();
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                      video: { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 15 } },
+                      audio: { echoCancellation: true, noiseSuppression: true },
+                    });
+                    if (
+                      !stream.getVideoTracks().some(track => track.readyState === "live") ||
+                      !stream.getAudioTracks().some(track => track.readyState === "live")
+                    ) {
+                      stream.getTracks().forEach(track => track.stop());
+                      throw new Error("Both camera and microphone must be working.");
+                    }
+                    previewStreamRef.current = stream;
+                    setPreviewReady(true);
+                    setView("prepare");
+                  } catch (error: any) {
+                    setMessage(`⚠ Camera/microphone permission required: ${error?.message || error}`);
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                {busy
+                  ? "Checking camera and microphone..."
+                  : "Agree & Preview Camera"}
+              </button>
+
+              <button
+                type="button"
+                className="secondary"
+                disabled={busy}
+                onClick={() => {
+                  setPendingExam(null);
+                  setExamConsent(false);
+                  setView("home");
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+
+            <p className="student-consent-note">
+              <small>
+                Without consent and camera/microphone access,
+                you cannot begin the examination.
+              </small>
+            </p>
+          </section>
+        )}
+
+
+        {view === "prepare" && pendingExam && (
+          <section className="panel student-prepare">
+            <h2>Camera Check — Ready to Begin</h2>
+            <div className="student-stepper">
+              <span>1 · Consent</span>
+              <span className="step-current">2 · Camera check</span>
+              <span>3 · Examination</span>
+            </div>
+            <p>Preview your face and check your camera position. <b>The exam timer has not started, and nothing is being recorded.</b></p>
+
+            <div className="student-preview-area">
+              <video
+                className="student-preview-video"
+                ref={previewVideoRef}
+                autoPlay
+                muted
+                playsInline
+              />
+
+              <div
+                className={
+                  previewReady
+                    ? "student-camera-status"
+                    : "student-camera-status is-unavailable"
+                }
+              >
+                {previewReady
+                  ? "✓ Camera and microphone connected — preview only"
+                  : "Camera or microphone unavailable"}
+              </div>
+            </div>
+
+            <p>When you click Start, ExamPilot will enter fullscreen, create your timed attempt, and begin webcam/microphone recording automatically.</p>
+            <div className="student-actions">
+              <button
+                type="button" className="primary"
+                disabled={!examConsent || !previewReady || busy}
+                onClick={() => void enterExamFullscreen()}
+              >
+                {busy ? "Starting examination..." : "Enter Fullscreen and Start Exam"}
+              </button>
+              <button
+                type="button" className="secondary" disabled={busy}
+                onClick={() => {
+                  releasePreviewStream();
+                  setExamConsent(false);
+                  setPendingExam(null);
+                  setView("home");
+                }}
+              >Cancel</button>
+            </div>
+          </section>
+        )}
+
         {/* ================================================== */}
         {/* STUDENT EXAMINATION — PRESERVED */}
         {/* ================================================== */}
 
         {view === "exam" && active && (
 
-          <section className="panel">
+          <section className="panel student-exam-panel">
 
-            <h2>Assessment questions</h2>
 
-            <p>
-              Answers are submitted to the backend for evaluation.
-            </p>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                padding: 16,
+                marginBottom: 18,
+                background:
+                  remainingSeconds !== null && remainingSeconds <= 60
+                    ? "#fef2f2"
+                    : "#f1f5f9",
+                borderRadius: 12,
+              }}
+            >
+              <div>
+                <h3 style={{ margin: 0 }}>Examination Timer</h3>
+                <small>Time remaining for this attempt</small>
+              </div>
 
-            {(active.questions || []).map((q, i) => {
 
-              const id = qid(q, i);
+              <div
+                className={`student-exam-timer ${remainingSeconds !== null && remainingSeconds <= 60
+                  ? "timer-warning"
+                  : ""
+                  }`}
+              >
+                <div>
+                  <h3>Examination Timer</h3>
+                  <p>Time remaining for this attempt</p>
+                </div>
 
-              const opts = Array.isArray(q.options)
-                ? q.options.map((v: any, j: number) => [
-                    String.fromCharCode(65 + j),
-                    String(v),
-                  ])
-                : Object.entries(q.options || {});
-
-              return (
-
-                <article
-                  className="question"
-                  key={id}
+                <div
+                  className="student-exam-time"
+                  role="timer"
+                  aria-label="Exam time remaining"
                 >
+                  {remainingSeconds === null
+                    ? "--:--"
+                    : `${String(Math.floor(remainingSeconds / 60)).padStart(2, "0")}:${String(remainingSeconds % 60).padStart(2, "0")}`}
+                </div>
+              </div>
 
-                  <small>
-                    QUESTION {i + 1} · {q.question_type || "MCQ"}
-                  </small>
+            </div>
 
-                  <h3>
-                    {q.question ||
-                      q.text ||
-                      "Question text unavailable."}
-                  </h3>
 
-                  {opts.length ? (
+            <div className="student-exam-workspace">
+              <div className="student-exam-camera-column">
 
-                    <div className="options">
+                <ExamCamera
+                  ref={examCameraRef}
+                  sessionId={active.session_id}
+                  token={token}
+                  clientId={examClientRef.current}
+                  autoStart={true}
+                  initialStream={previewStreamRef.current}
+                  onRecordingChange={setRecordingActive}
+                />
 
-                      {opts.map(([k, v]: any) => (
+              </div>
 
-                        <label
-                          key={k}
-                          className={
-                            answers[id] === k
-                              ? "chosen"
-                              : ""
-                          }
-                        >
+              <div className="student-exam-questions-column">
 
-                          <input
-                            type="radio"
-                            name={id}
-                            checked={answers[id] === k}
-                            onChange={() =>
-                              setAnswers({
-                                ...answers,
-                                [id]: k,
-                              })
-                            }
-                          />
 
-                          <b>{k}</b>
 
-                          {v}
 
-                        </label>
+                {!recordingActive ? (
+                  <div style={{ padding: 20 }}>
+                    <h3>Starting secure recording...</h3>
+                    <p>Please remain in fullscreen. Exam questions unlock as soon as recording starts.</p>
+                    {securityNotice && <p role="alert" style={{ color: "red" }}>⚠ {securityNotice}</p>}
+                  </div>
+                ) : !examFullscreen ? (
+                  <div style={{ padding: 20 }}>
+                    <h3>Fullscreen exited</h3>
+                    <p>Return to fullscreen to continue. The security incident is logged, and recording continues.</p>
+                    <button type="button" className="primary" onClick={() => {
+                      void document.documentElement.requestFullscreen()
+                        .then(() => setExamFullscreen(true))
+                        .catch(() => setSecurityNotice("Fullscreen permission denied."));
+                    }}>Return to Fullscreen</button>
+                  </div>
+                ) : (
+                  <>
+                    <div className="student-security-summary">
+                      <span>
+                        <ShieldCheck size={17} />
+                        Secure Exam Mode
+                      </span>
 
-                      ))}
-
+                      <strong>
+                        Security incidents: {securityViolations} / 4
+                      </strong>
                     </div>
 
-                  ) : (
+                    {securityNotice && (
+                      <div className="student-security-alert" role="alert">
+                        <AlertTriangle size={18} />
+                        <span>{securityNotice}</span>
+                      </div>
+                    )}
 
-                    <label>
-                      Your answer
+                    <div className="student-questions-header">
+                      <div>
+                        <h2>Assessment questions</h2>
+                        <p>Choose your answers carefully before submitting.</p>
+                      </div>
 
-                      <textarea
-                        rows={4}
-                        value={answers[id] || ""}
-                        onChange={(e) =>
-                          setAnswers({
-                            ...answers,
-                            [id]: e.target.value,
-                          })
-                        }
-                      />
+                      <span className="student-question-count">
+                        {(active.questions || []).length} questions
+                      </span>
+                    </div>
 
-                    </label>
+                    {(active.questions || []).map((q, i) => {
 
-                  )}
+                      const id = qid(q, i);
 
-                </article>
+                      const opts = Array.isArray(q.options)
+                        ? q.options.map((v: any, j: number) => [
+                          String.fromCharCode(65 + j),
+                          String(v),
+                        ])
+                        : Object.entries(q.options || {});
 
-              );
+                      return (
 
-            })}
+                        <article
+                          className="question"
+                          key={id}
+                        >
 
-            <button
-              className="primary"
-              disabled={busy}
-              onClick={submit}
-            >
-              {busy
-                ? "Submitting…"
-                : "Submit for evaluation"}
+                          <small>
+                            QUESTION {i + 1} · {q.question_type || "MCQ"}
+                          </small>
 
-              <ArrowRight size={16} />
+                          <h3>
+                            {q.question ||
+                              q.text ||
+                              "Question text unavailable."}
+                          </h3>
 
-            </button>
+                          {opts.length ? (
+
+                            <div className="options">
+
+                              {opts.map(([k, v]: any) => (
+
+                                <label
+                                  key={k}
+                                  className={
+                                    answers[id] === k
+                                      ? "chosen"
+                                      : ""
+                                  }
+                                >
+
+                                  <input
+                                    type="radio"
+                                    name={id}
+                                    checked={answers[id] === k}
+                                    onChange={() => {
+                                      setAnswers((previous) => ({
+                                        ...previous,
+                                        [id]: k,
+                                      }));
+
+                                      void saveAnswerImmediately(id, k);
+                                    }}
+                                  />
+
+                                  <b>{k}</b>
+
+                                  {v}
+
+                                </label>
+
+                              ))}
+
+                            </div>
+
+                          ) : (
+
+                            <label>
+                              Your answer
+
+                              <textarea
+                                rows={4}
+                                value={answers[id] || ""}
+                                onChange={(e) => {
+                                  const value = e.target.value;
+
+                                  setAnswers((previous) => ({
+                                    ...previous,
+                                    [id]: value,
+                                  }));
+
+                                  void saveAnswerImmediately(id, value);
+                                }}
+                              />
+
+                            </label>
+
+                          )}
+
+                        </article>
+
+                      );
+
+                    })}
+
+                    <button
+                      className="primary"
+                      disabled={busy}
+                      onClick={submit}
+                    >
+                      {busy
+                        ? "Submitting…"
+                        : "Submit for evaluation"}
+
+                      <ArrowRight size={16} />
+
+                    </button>
+
+                  </>
+                )}
+              </div>
+            </div>
 
           </section>
 
@@ -2713,11 +4324,18 @@ if (
 
                   <Trophy size={34} />
 
-                  <h2>Thank you!</h2>
+                  <h2>
+                    {result.exam_terminated
+                      ? "Examination Terminated"
+                      : "Thank you!"}
+                  </h2>
 
                   <p>
-                    Your examination has been submitted
-                    and evaluated successfully.
+                    {result.exam_terminated
+                      ? "Your examination was automatically ended because the security violation limit was reached."
+                      : result.evaluation_pending
+                        ? "Your examination has been submitted. Evaluation is pending."
+                        : "Your examination has been submitted for evaluation."}
                   </p>
 
                   {total > 0 && (
@@ -2747,7 +4365,13 @@ if (
                       <div>
                         <ShieldCheck />
                         <small>Status</small>
-                        <b>Completed</b>
+                        <b>
+                          {result.exam_terminated
+                            ? "Terminated"
+                            : result.evaluation_pending
+                              ? "Pending"
+                              : "Completed"}
+                        </b>
                       </div>
 
                     </div>

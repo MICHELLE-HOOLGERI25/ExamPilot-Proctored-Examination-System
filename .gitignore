@@ -47,3 +47,20 @@ frontend/dist/
 
 # Uploaded professor notes
 /backend/app/uploads/
+
+# ExamPilot - Private student webcam and microphone recordings
+backend/app/private_recordings/
+
+# Database exports and backups
+*.dump
+*.sql
+
+# Recorded video and audio files
+*.webm
+*.mp4
+
+# Private recordings in any subfolder
+private_recordings/
+
+# Local application secrets
+.auth_secret

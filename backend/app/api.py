@@ -18,6 +18,7 @@ from fastapi import (
     Depends,
     FastAPI,
     HTTPException,
+    Header,
     File,
     Form,
     UploadFile,
@@ -29,7 +30,12 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.database import SessionLocal
-from backend.app.models import User, Exam, ExamAttempt
+from backend.app.models import (
+    User,
+    Exam,
+    ExamAttempt,
+    ProctoringEvent,
+)
 from backend.app.exampilot_persistence import sync_state
 
 from backend.app.agents.exam_session_agent.exam_session_agent import ExamSessionAgent
@@ -43,8 +49,19 @@ from backend.app.document_processing.text_extractor import (
 )
 from backend.app.document_processing.chunker import chunk_text
 from backend.app.document_processing.vector_store import save_chunks
+from backend.app.exampilot_recordings import create_recordings_router
 
 from copy import deepcopy
+
+
+from uuid import uuid5, NAMESPACE_URL
+
+from backend.app.demo_exam import (
+    DEMO_QUESTIONS,
+    DEMO_SUBJECT,
+    DEMO_TOPIC,
+    grade_demo_attempt,
+)
 
 
 
@@ -68,6 +85,21 @@ app.add_middleware(
 session_agent = ExamSessionAgent()
 sessions: dict[str, dict[str, Any]] = {}
 sessions_lock = Lock()
+
+
+EXAMPILOT_DEMO_MODE = (
+    os.getenv("EXAMPILOT_DEMO_MODE", "false").lower()
+    == "true"
+)
+
+
+def require_demo_mode() -> None:
+    if not EXAMPILOT_DEMO_MODE:
+        raise HTTPException(
+            status_code=404,
+            detail="Development demo exams are disabled",
+        )
+
 
 SECRET_FILE = Path(__file__).resolve().parent / ".auth_secret"
 AUTH_SECRET = os.getenv("AUTH_SECRET_KEY")
@@ -150,6 +182,109 @@ class ScheduleRequest(BaseModel):
     scheduled_start_at: datetime | None = None
     scheduled_end_at: datetime | None = None
     duration_minutes: int = Field(default=30, ge=1, le=1440)
+
+
+# ============================================================
+# PROCTORING - REQUEST SCHEMA
+# ============================================================
+
+class ExamClientRequest(BaseModel):
+    client_id: str = Field(..., min_length=16, max_length=100)
+
+
+class StartExamRequest(BaseModel):
+    consent_accepted: bool
+
+class ProctoringEventRequest(BaseModel):
+    event_type: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+ALLOWED_PROCTORING_EVENTS = {
+    "fullscreen_exit",
+    "tab_switch",
+    "window_blur",
+    "copy_attempt",
+    "paste_attempt",
+    "context_menu",
+}
+
+
+# ============================================================
+# PROCTORING WARNING POLICY
+# ============================================================
+
+PROCTORING_TERMINATION_THRESHOLD = 4
+PROCTORING_INCIDENT_WINDOW_SECONDS = 2.0
+
+
+def calculate_proctoring_warning_status(events):
+    """
+    Group closely spaced browser events into incidents.
+
+    Events are ordered by their server timestamps.
+    Multiple events within two seconds of an incident's
+    first event count as one incident.
+
+    This is an initial policy for development and testing.
+    """
+
+    ordered_events = sorted(
+        events,
+        key=lambda event: (event.occurred_at, event.id),
+    )
+
+    incidents = []
+
+    for event in ordered_events:
+        event_time = event.occurred_at
+
+        if not incidents:
+            incidents.append([event])
+            continue
+
+        first_event = incidents[-1][0]
+
+        elapsed = (
+            event_time - first_event.occurred_at
+        ).total_seconds()
+
+        if elapsed < PROCTORING_INCIDENT_WINDOW_SECONDS:
+            incidents[-1].append(event)
+        else:
+            incidents.append([event])
+
+    count = len(incidents)
+
+    if count == 0:
+        level = "clear"
+        warning = "No security warnings recorded."
+
+    elif count == 1:
+        level = "warning"
+        warning = "First warning: Follow examination rules."
+
+    elif count == 2:
+        level = "warning"
+        warning = "Second warning: Further violations may terminate your exam."
+
+    elif count == 3:
+        level = "final_warning"
+        warning = "Final warning: The next incident reaches the termination threshold."
+
+    else:
+        level = "termination_threshold"
+        warning = "Security violation limit reached. Examination flagged for termination."
+
+    return {
+        "incident_count": count,
+        "total_events": len(ordered_events),
+        "warning_level": level,
+        "warning_message": warning,
+        "termination_threshold_reached": (
+            count >= PROCTORING_TERMINATION_THRESHOLD
+        ),
+    }
 
 
 class AnswerRequest(BaseModel):
@@ -261,8 +396,18 @@ def require_role(*allowed_roles: str):
                 detail="Your account does not have permission for this action",
             )
         return user
+    
 
     return dependency
+
+# ============================================================
+# AUDIO/VIDEO RECORDING ENDPOINTS
+# Permanent ExamPilot feature
+# ============================================================
+
+app.include_router(
+    create_recordings_router(get_current_user)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +423,9 @@ def public_session(state: dict[str, Any]) -> dict[str, Any]:
         "session_id": session.get("session_id"),
         "exam_id": session.get("exam_id"),
         "status": session.get("status"),
+        "proctoring_terminated": bool(
+    state.get("_proctoring_terminated", False)
+),
         "started_at": session.get("started_at"),
         "ends_at": session.get("ends_at"),
         "total_questions": session.get("total_questions", len(questions)),
@@ -350,6 +498,36 @@ def _hydrate_sessions() -> None:
 
 _hydrate_sessions()
 
+def load_session(session_id: str) -> dict[str, Any]:
+    """
+    Load the latest examination state from PostgreSQL.
+    """
+
+    with SessionLocal() as db:
+        attempt = db.get(ExamAttempt, session_id)
+
+        if attempt is not None and attempt.session_state:
+            state = deepcopy(attempt.session_state)
+            sessions[session_id] = state
+            return state
+
+        exam = db.get(Exam, session_id)
+
+        if exam is not None and exam.generation_state:
+            state = deepcopy(exam.generation_state)
+            sessions[session_id] = state
+            return state
+
+    state = sessions.get(session_id)
+
+    if state is not None:
+        return state
+
+    raise HTTPException(
+        status_code=404,
+        detail="Exam session not found",
+    )
+
 
 @app.put("/api/teacher/exams/{assignment_id}/schedule")
 def set_exam_schedule(
@@ -395,42 +573,138 @@ def _check_attempt_deadline(state: dict[str, Any]) -> None:
             raise HTTPException(409, "Exam time has expired")
 
 
-def load_session(session_id: str) -> dict[str, Any]:
-    """
-    Load the latest session state from PostgreSQL.
 
-    PostgreSQL is the source of truth because the timeout
-    worker runs in a separate process.
-    """
+# ============================================================
+# EXAM CLIENT PROTECTION
+# ============================================================
 
-    # First, check student exam attempts.
-    with SessionLocal() as db:
-        attempt = db.get(ExamAttempt, session_id)
+EXAM_HEARTBEAT_TIMEOUT_SECONDS = 45
 
-        if attempt is not None and attempt.session_state:
-            state = deepcopy(attempt.session_state)
-            sessions[session_id] = state
-            return state
 
-        # If it is not an attempt, check exam assignments.
-        exam = db.get(Exam, session_id)
+def verify_exam_client(
+    state: dict[str, Any],
+    client_id: str | None,
+) -> None:
+    registered = state.get("_exam_client_id")
 
-        if exam is not None and exam.generation_state:
-            state = deepcopy(exam.generation_state)
-            sessions[session_id] = state
-            return state
+    if not registered or client_id != registered:
+        raise HTTPException(
+            status_code=409,
+            detail="This exam is active in another browser session.",
+        )
 
-    # Fallback to the in-memory cache.
-    state = sessions.get(session_id)
 
-    if state is not None:
-        return state
+def verify_active_student_attempt(
+    state: dict[str, Any],
+    user: dict[str, Any],
+) -> None:
+    if state.get("_is_assignment"):
+        raise HTTPException(409, "Start the examination first")
 
-    raise HTTPException(
-        status_code=404,
-        detail="Exam session not found",
+    if not _can_access_attempt(state, user):
+        raise HTTPException(403, "Not your examination attempt")
+
+    if state["exam_session"]["status"] != "in_progress":
+        raise HTTPException(409, "This examination has already ended")
+
+
+
+# ============================================================
+# SHARED EXAM FINALIZATION
+# Called while sessions_lock is already held.
+# ============================================================
+
+def finalize_exam_locked(
+    session_id: str,
+    *,
+    proctoring_terminated: bool = False,
+) -> dict[str, Any]:
+
+    state = load_session(session_id)
+
+    if state.get("_is_assignment"):
+        raise HTTPException(
+            409, "This is not a student exam attempt"
+        )
+
+    session = ExamSession.model_validate(
+        state["exam_session"]
     )
 
+    if session.status != ExamSessionStatus.IN_PROGRESS:
+        raise HTTPException(
+            409, "This examination has already ended"
+        )
+
+    # Use the original ExamPilot submission mechanism.
+    # It also handles exams whose time has expired.
+    session = session_agent.submit_session(session)
+
+    state["exam_session"] = session.model_dump(mode="json")
+
+    state["answers"] = [
+        answer.model_dump(mode="json")
+        for answer in session.answers.values()
+    ]
+
+    if proctoring_terminated:
+        state["_proctoring_terminated"] = True
+        state["_proctoring_termination_reason"] = (
+            "Security violation limit reached"
+        )
+
+    # Persist the locked attempt BEFORE evaluation.
+    _save_state(state)
+    sessions[session_id] = state
+
+    try:
+        
+        evaluation = (
+            grade_demo_attempt(state)
+            if state.get("_demo_exam")
+            else evaluation_node(state)
+        )
+
+
+        if evaluation.get("current_stage") == "error":
+            error_message = str(
+                evaluation.get(
+                    "errors",
+                    ["Evaluation failed"]
+                )
+            )
+            raise RuntimeError(error_message)
+
+        state.update(evaluation)
+        state["_evaluation_pending"] = False
+
+        _save_state(state)
+        sessions[session_id] = state
+
+    except Exception as exc:
+        # Keep the exam locked even if grading fails.
+        state["_evaluation_pending"] = True
+        state["_evaluation_error"] = str(exc)
+
+        _save_state(state)
+        sessions[session_id] = state
+
+    return {
+        "message": (
+            "Exam automatically terminated"
+            if proctoring_terminated
+            else "Exam submitted"
+        ),
+        "exam_terminated": proctoring_terminated,
+        "status": state["exam_session"]["status"],
+        "evaluation_pending": state.get(
+            "_evaluation_pending", False
+        ),
+        "result": state.get("final_result"),
+        "evaluation_results": state.get(
+            "evaluation_results", []
+        ),
+    }
 
 # ---------------------------------------------------------------------------
 # Basic endpoints
@@ -525,17 +799,48 @@ def _same_division(a: Any, b: Any) -> bool:
     return str(a or "").strip().upper() == str(b or "").strip().upper()
 
 
+
 def _student_attempt_for_assignment(
     assignment_id: str,
     student_email: str,
 ) -> tuple[str, dict[str, Any]] | None:
-    for sid, state in sessions.items():
+
+    assignment = sessions.get(assignment_id) or {}
+    is_demo = bool(assignment.get("_demo_exam"))
+
+    matches = [
+        (sid, state)
+        for sid, state in sessions.items()
         if (
-            state.get("_assignment_id") == assignment_id
+            not state.get("_is_assignment")
+            and state.get("_assignment_id") == assignment_id
             and state.get("_student_email") == student_email
-        ):
-            return sid, state
+        )
+    ]
+
+    if not matches:
+        return None
+
+    if not is_demo:
+        # Original behavior: only one real attempt.
+        return matches[0]
+
+    # Demo behavior: reuse the student's active attempt.
+    # When the previous demo attempt has ended, a new
+    # one can be created from the assignment.
+    active = [
+        (sid, state)
+        for sid, state in matches
+        if (
+            state.get("exam_session") or {}
+        ).get("status") == "in_progress"
+    ]
+
+    if active:
+        return active[-1]
+
     return None
+
 
 
 def _can_access_attempt(state: dict[str, Any], user: dict[str, Any]) -> bool:
@@ -549,6 +854,102 @@ def _can_access_attempt(state: dict[str, Any], user: dict[str, Any]) -> bool:
             user.get("division"),
         )
     )
+
+
+
+@app.post("/api/dev/demo-exam")
+def create_demo_exam(
+    user: dict[str, Any] = Depends(require_role("teacher")),
+):
+    """Create or return this teacher's development fixture."""
+    require_demo_mode()
+
+    # Stable ID: repeated requests do not create duplicate exams.
+    # Create a fresh development exam without calling Gemini.
+    # Previous students' attempts and results remain untouched.
+    assignment_id = str(uuid4())
+
+    target_division = "A"
+
+    with sessions_lock:
+        with SessionLocal.begin() as db:
+            existing = db.get(Exam, assignment_id)
+
+            if existing is not None:
+                if not existing.generation_state:
+                    raise HTTPException(
+                        409,
+                        "Demo exam record has no saved state",
+                    )
+
+                sessions[assignment_id] = existing.generation_state
+
+                return {
+                    "message": "Demo exam already exists",
+                    "assignment_id": assignment_id,
+                    "created": False,
+                }
+
+            # This has the same assignment metadata shape
+            # used by ExamPilot's existing exam listing.
+            state = {
+                "_is_assignment": True,
+                "_demo_exam": True,
+                "_assignment_id": assignment_id,
+                "_owner_email": user["email"],
+                "_owner_role": "teacher",
+                "_target_division": target_division,
+                "_subject": DEMO_SUBJECT,
+                "_topic": DEMO_TOPIC,
+                "_difficulty": "L1",
+                "_document_ids": [],
+                "requirements": {
+                    "teacher_id": user["id"],
+                    "notes_only": False,
+                    "demo_exam": True,
+                },
+                "questions": DEMO_QUESTIONS,
+                "validated_questions": DEMO_QUESTIONS,
+                "student_questions": [],
+                "answers": [],
+                "evaluation_results": [],
+                "final_result": None,
+                "exam_session": {
+                    "session_id": assignment_id,
+                    "exam_id": assignment_id,
+                    "status": "assigned",
+                    "total_questions": len(DEMO_QUESTIONS),
+                    "answered_questions": 0,
+                },
+            }
+
+            db.add(
+                Exam(
+                    id=assignment_id,
+                    teacher_id=user["id"],
+                    division=target_division,
+                    subject=DEMO_SUBJECT,
+                    topic=DEMO_TOPIC,
+                    difficulty="L1",
+                    status="assigned",
+                    duration_minutes=10,
+                    scheduled_start_at=None,
+                    scheduled_end_at=None,
+                    generation_state=json.loads(
+                        json.dumps(state, default=str)
+                    ),
+                )
+            )
+
+        sessions[assignment_id] = state
+
+    return {
+        "message": "Reusable demo exam created",
+        "assignment_id": assignment_id,
+        "created": True,
+        "division": target_division,
+        "total_questions": len(DEMO_QUESTIONS),
+    }
 
 
 @app.post("/api/exams")
@@ -704,6 +1105,19 @@ def list_teacher_exams(
                 continue
 
             assignment_id = state.get("_assignment_id")
+            # Read the authoritative schedule from PostgreSQL.
+            with SessionLocal() as db:
+               exam_record = db.get(Exam, str(assignment_id))
+               scheduled_end_at = (
+                 exam_record.scheduled_end_at
+                 if exam_record is not None
+                 else None
+                )
+
+            schedule_closed = bool(
+               scheduled_end_at is not None
+               and _utc(scheduled_end_at) <= datetime.now(timezone.utc)
+            )
 
             attempts = [
                 attempt
@@ -738,6 +1152,8 @@ def list_teacher_exams(
                 "attempt_count": len(attempts),
                 "submitted_count": submitted,
                 "in_progress_count": in_progress,
+                "scheduled_end_at": scheduled_end_at,
+                "schedule_closed": schedule_closed, 
             })
 
             exams.append(exam)
@@ -950,8 +1366,8 @@ def get_exam(
                 "topic": state.get("_topic"),
             }
 
-        # STUDENT OPENING A DIVISION ASSIGNMENT:
-        # create/reuse their own private attempt.
+        # Reading an assignment must NOT create a timed attempt.
+        # Students start it explicitly via POST /start after consent.
         if state.get("_is_assignment"):
             if not _same_division(
                 state.get("_target_division"),
@@ -961,10 +1377,9 @@ def get_exam(
                     status_code=403,
                     detail="This examination is assigned to another division",
                 )
+            return public_session(state)
 
-            state = _create_student_attempt(state, user)
-
-        elif not _can_access_attempt(state, user):
+        if not _can_access_attempt(state, user):
             raise HTTPException(
                 status_code=403,
                 detail="This examination is not assigned to your account",
@@ -973,45 +1388,297 @@ def get_exam(
         return public_session(state)
 
 
-@app.post("/api/exams/{session_id}/answers")
-def save_answer(
+@app.post("/api/exams/{assignment_id}/start")
+def start_student_exam(
+    assignment_id: str,
+    request: StartExamRequest,
+    user: dict[str, Any] = Depends(require_role("student")),
+):
+    if request.consent_accepted is not True:
+        raise HTTPException(403, "Camera and microphone recording consent is required")
+
+    with sessions_lock:
+        state = load_session(assignment_id)
+
+        # Older student exam cards can contain an existing attempt ID.
+        # Resolve that ID to its parent assignment, but never let one
+        # student access somebody else's attempt.
+        if not state.get("_is_assignment"):
+            if not _can_access_attempt(state, user):
+                raise HTTPException(403, "Not your examination attempt")
+            assignment_id = str(state["_assignment_id"])
+            state = load_session(assignment_id)
+
+        if not _same_division(state.get("_target_division"), user.get("division")):
+            raise HTTPException(403, "This examination is assigned to another division")
+
+        # Reuse an existing valid attempt. A real exam cannot be restarted
+        # or have its deadline reset by clicking Start again.
+        attempt = _create_student_attempt(state, user)
+        status = str((attempt.get("exam_session") or {}).get("status"))
+        if status != "in_progress":
+            raise HTTPException(
+                409, "This examination was already completed. A new attempt is not allowed."
+            )
+
+        try:
+            _check_attempt_deadline(attempt)
+        except HTTPException as exc:
+            raise HTTPException(
+                409,
+                "This existing attempt has expired. Its timer cannot be restarted."
+            ) from exc
+
+        return public_session(attempt)
+
+
+
+# ============================================================
+# CLAIM AN EXAM CLIENT
+# ============================================================
+
+@app.post("/api/exams/{session_id}/client/claim")
+def claim_exam_client(
     session_id: str,
-    request: AnswerRequest,
+    request: ExamClientRequest,
+    user: dict[str, Any] = Depends(require_role("student")),
+):
+    with sessions_lock:
+        state = load_session(session_id)
+        verify_active_student_attempt(state, user)
+
+        now = datetime.now(timezone.utc)
+        registered = state.get("_exam_client_id")
+        last_seen = state.get("_exam_client_last_seen")
+
+        recently_active = False
+
+        if registered and last_seen:
+            try:
+                last_time = _utc(
+                    datetime.fromisoformat(
+                        str(last_seen).replace("Z", "+00:00")
+                    )
+                )
+                recently_active = (
+                    (now - last_time).total_seconds()
+                    < EXAM_HEARTBEAT_TIMEOUT_SECONDS
+                )
+            except ValueError:
+                recently_active = False
+
+        if (
+            registered
+            and registered != request.client_id
+            and recently_active
+        ):
+            raise HTTPException(
+                409,
+                "This examination is already active in another session.",
+            )
+
+        state["_exam_client_id"] = request.client_id
+        state["_exam_client_last_seen"] = now.isoformat()
+
+        _save_state(state)
+        sessions[session_id] = state
+
+        return {
+            "message": "Exam client registered",
+            "status": "in_progress",
+            "heartbeat_interval_seconds": 15,
+        }
+
+
+# ============================================================
+# EXAM HEARTBEAT
+# ============================================================
+
+@app.post("/api/exams/{session_id}/client/heartbeat")
+def exam_heartbeat(
+    session_id: str,
+    request: ExamClientRequest,
     user: dict[str, Any] = Depends(require_role("student")),
 ):
     with sessions_lock:
         state = load_session(session_id)
 
+        verify_active_student_attempt(state, user)
+        verify_exam_client(state, request.client_id)
+
+        state["_exam_client_last_seen"] = (
+            datetime.now(timezone.utc).isoformat()
+        )
+
+        _save_state(state)
+        sessions[session_id] = state
+
+        return {
+            "status": "in_progress",
+            "connected": True,
+            "server_time": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+
+# ============================================================
+# PROCTORING - EVENTS AND AUTOMATIC TERMINATION
+# ============================================================
+
+@app.post("/api/exams/{session_id}/proctoring/events")
+def record_proctoring_event(
+    session_id: str,
+    request: ProctoringEventRequest,
+    user: dict[str, Any] = Depends(require_role("student")),
+):
+    if request.event_type not in ALLOWED_PROCTORING_EVENTS:
+        raise HTTPException(
+            422, "Unsupported proctoring event type"
+        )
+
+    if len(json.dumps(request.details)) > 2048:
+        raise HTTPException(
+            422, "Proctoring event details are too large"
+        )
+
+    with sessions_lock:
+
+        # First save the security event and determine
+        # the official incident count.
+        with SessionLocal.begin() as db:
+
+            attempt = db.get(ExamAttempt, session_id)
+
+            if attempt is None:
+                raise HTTPException(
+                    404, "Exam attempt not found"
+                )
+
+            if attempt.student_id != user["id"]:
+                raise HTTPException(
+                    403, "This is not your exam attempt"
+                )
+
+            if attempt.status != "in_progress":
+                raise HTTPException(
+                    409, "This examination has already ended"
+                )
+
+            event = ProctoringEvent(
+                attempt_id=attempt.id,
+                event_type=request.event_type,
+                details=request.details,
+                occurred_at=datetime.now(timezone.utc),
+            )
+
+            db.add(event)
+            db.flush()
+
+            event_id = event.id
+
+            attempt_events = db.scalars(
+                select(ProctoringEvent)
+                .where(
+                    ProctoringEvent.attempt_id == attempt.id
+                )
+                .order_by(
+                    ProctoringEvent.occurred_at,
+                    ProctoringEvent.id,
+                )
+            ).all()
+
+            warning_status = (
+                calculate_proctoring_warning_status(
+                    attempt_events
+                )
+            )
+
+        # The event transaction has committed.
+        # Never call the shared finalization function
+        # inside the database transaction above.
+
+        if warning_status["termination_threshold_reached"]:
+
+            termination_result = finalize_exam_locked(
+                session_id,
+                proctoring_terminated=True,
+            )
+
+            return {
+                "message": "Exam automatically terminated",
+                "event_id": event_id,
+                "attempt_id": session_id,
+                "event_type": request.event_type,
+                **warning_status,
+                "exam_terminated": True,
+                "termination_result": termination_result,
+            }
+
+        return {
+            "message": "Proctoring event recorded",
+            "event_id": event_id,
+            "attempt_id": session_id,
+            "event_type": request.event_type,
+            **warning_status,
+            "exam_terminated": False,
+            "termination_result": None,
+        }
+
+
+# ============================================================
+# PROCTORING - RECORD SECURITY VIOLATIONS
+# ============================================================
+
+@app.post("/api/exams/{session_id}/answers")
+def save_answer(
+    session_id: str,
+    request: AnswerRequest,
+    client_id: str | None = Header(default=None, alias="X-Exam-Client"),
+    user: dict[str, Any] = Depends(require_role("student")),
+):
+    with sessions_lock:
+        state = load_session(session_id)
+
+        # 1. Ensure this is a student attempt.
         if state.get("_is_assignment"):
             raise HTTPException(
                 status_code=409,
                 detail="Start the examination before answering",
             )
 
+        # 2. Verify that this attempt belongs to the student.
         if not _can_access_attempt(state, user):
             raise HTTPException(
                 status_code=403,
                 detail="This examination is not assigned to your account",
             )
 
+        # 3. Verify that this is the registered exam browser.
+        verify_exam_client(state, client_id)
+
         try:
             session = ExamSession.model_validate(
                 state["exam_session"]
             )
 
+            # 4. Reject answers after time expires.
             _check_attempt_deadline(state)
+
+            # 5. Reject answers after submission or termination.
             if session.status != ExamSessionStatus.IN_PROGRESS:
                 raise HTTPException(
                     status_code=409,
                     detail="This exam is not accepting answers",
                 )
 
+            # 6. Verify the question belongs to this attempt.
             if request.question_id not in session_question_ids(state):
                 raise HTTPException(
                     status_code=404,
                     detail="Question not found in this examination",
                 )
 
+            # 7. Save the student's answer.
             session_agent.submit_answer(
                 session=session,
                 question_id=request.question_id,
@@ -1025,6 +1692,7 @@ def save_answer(
                 for answer in session.answers.values()
             ]
 
+            # 8. Persist the answer in PostgreSQL.
             _save_state(state)
             sessions[session_id] = state
 
@@ -1036,11 +1704,14 @@ def save_answer(
 
         except HTTPException:
             raise
+
         except ValueError as exc:
             raise HTTPException(
                 status_code=400,
                 detail=str(exc),
             ) from exc
+
+
 
 
 @app.post("/api/exams/{session_id}/submit")
@@ -1053,77 +1724,27 @@ def submit_exam(
 
         if state.get("_is_assignment"):
             raise HTTPException(
-                status_code=409,
-                detail="Start the examination before submitting",
+                409, "Start the examination before submitting"
             )
 
         if not _can_access_attempt(state, user):
             raise HTTPException(
-                status_code=403,
-                detail="This examination is not assigned to your account",
+                403, "This examination is not assigned to you"
             )
 
         try:
-            session = ExamSession.model_validate(
-                state["exam_session"]
+            return finalize_exam_locked(
+                session_id,
+                proctoring_terminated=False,
             )
-
-            if session.status != ExamSessionStatus.IN_PROGRESS:
-                raise HTTPException(
-                    status_code=409,
-                    detail="This examination has already been submitted",
-                )
-
-            # Locks the attempt BEFORE evaluation.
-            session = session_agent.submit_session(session)
-
-            state["exam_session"] = session.model_dump(mode="json")
-
-            state["answers"] = [
-                answer.model_dump(mode="json")
-                for answer in session.answers.values()
-            ]
-            # Persist the final session status and answers before evaluation.
-            _save_state(state)
-            sessions[session_id] = state
-
-
-            # Existing Friend-4 evaluation pipeline.
-            evaluation = evaluation_node(state)
-
-            if evaluation.get("current_stage") == "error":
-                raise HTTPException(
-                    status_code=400,
-                    detail=evaluation.get(
-                        "errors",
-                        ["Evaluation failed"],
-                    ),
-                )
-
-            state.update(evaluation)
-            _save_state(state)
-            sessions[session_id] = state
-
-            return {
-                "message": "Exam submitted and evaluated",
-                "result": state.get("final_result"),
-                "evaluation_results": state.get(
-                    "evaluation_results",
-                    [],
-                ),
-            }
 
         except HTTPException:
             raise
+
         except ValueError as exc:
             raise HTTPException(
                 status_code=400,
                 detail=str(exc),
-            ) from exc
-        except Exception as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Submission failed: {exc}",
             ) from exc
 
 
@@ -1242,9 +1863,54 @@ def teacher_results(
             )
 
             session_data = state.get("exam_session") or {}
+            
+            
+            # ----------------------------------------------
+            # PROCTORING SUMMARY FOR THIS STUDENT ATTEMPT
+            # ----------------------------------------------
+
+            proctoring_events = db.scalars(
+                select(ProctoringEvent)
+                .where(
+                    ProctoringEvent.attempt_id == attempt.id
+                )
+                .order_by(
+                    ProctoringEvent.occurred_at,
+                    ProctoringEvent.id,
+                )
+            ).all()
+
+            proctoring_status = (
+                calculate_proctoring_warning_status(
+                    proctoring_events
+                )
+            )
+
+            proctoring_details = [
+                {
+                    "id": event.id,
+                    "event_type": event.event_type,
+                    "message": (
+                        (event.details or {}).get("message")
+                        or event.event_type
+                    ),
+                    "occurred_at": event.occurred_at.isoformat(),
+                }
+                for event in proctoring_events
+            ]
+
 
             rows.append({
                 "session_id": attempt.id,
+                "warning_count": min(
+    proctoring_status["incident_count"], 3
+),
+"incident_count": proctoring_status["incident_count"],
+"security_event_count": proctoring_status["total_events"],
+"proctoring_terminated": bool(
+    state.get("_proctoring_terminated", False)
+),
+"proctoring_events": proctoring_details,
                 "assignment_id": state.get("_assignment_id"),
                 "student_name": state.get("_student_name") or "Student",
                 "student_usn": state.get("_student_usn") or "",
