@@ -47,7 +47,7 @@ class QuestionGenerationAgent:
 
         self.model = os.getenv(
             "GEMINI_MODEL",
-            "gemini-3.5-flash-lite",
+            "gemini-3.6-flash",
         )
 
     # ======================================================

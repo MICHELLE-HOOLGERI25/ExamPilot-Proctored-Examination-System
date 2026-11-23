@@ -207,6 +207,20 @@ ALLOWED_PROCTORING_EVENTS = {
     "copy_attempt",
     "paste_attempt",
     "context_menu",
+
+    # AI observations — for teacher review only
+    "ai_face_absent",
+    "ai_multiple_faces",
+    "ai_mobile_phone",
+}
+
+BROWSER_VIOLATION_EVENTS = {
+    "fullscreen_exit",
+    "tab_switch",
+    "window_blur",
+    "copy_attempt",
+    "paste_attempt",
+    "context_menu",
 }
 
 
@@ -230,7 +244,11 @@ def calculate_proctoring_warning_status(events):
     """
 
     ordered_events = sorted(
-        events,
+        [
+            event
+            for event in events
+            if event.event_type in BROWSER_VIOLATION_EVENTS
+        ],
         key=lambda event: (event.occurred_at, event.id),
     )
 
@@ -1886,6 +1904,7 @@ def teacher_results(
                 )
             )
 
+            
             proctoring_details = [
                 {
                     "id": event.id,
@@ -1894,7 +1913,8 @@ def teacher_results(
                         (event.details or {}).get("message")
                         or event.event_type
                     ),
-                    "occurred_at": event.occurred_at.isoformat(),
+                   "details": event.details or {},
+                   "occurred_at": event.occurred_at.isoformat(),
                 }
                 for event in proctoring_events
             ]
@@ -1902,6 +1922,14 @@ def teacher_results(
 
             rows.append({
                 "session_id": attempt.id,
+                "started_at": (
+                    session_data.get("started_at")
+                    or (
+                        attempt.started_at.isoformat()
+                        if attempt.started_at
+                        else None
+                    )
+                ),
                 "warning_count": min(
     proctoring_status["incident_count"], 3
 ),

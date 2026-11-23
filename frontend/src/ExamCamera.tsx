@@ -7,6 +7,16 @@ import {
     useState,
 } from "react";
 
+import {
+    initializeFaceDetector,
+    detectFaces,
+} from "./AIProctor";
+
+import {
+    initializePhoneDetector,
+    detectPhone,
+} from "./PhoneDetector";
+
 type ExamCameraProps = {
     sessionId: string;
     token: string;
@@ -48,6 +58,38 @@ function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+
+function playFaceWarningTone() {
+    try {
+        const context = new AudioContext();
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+
+        oscillator.type = "sine";
+        oscillator.frequency.value = 660;
+
+        oscillator.connect(gain);
+        gain.connect(context.destination);
+
+        const now = context.currentTime;
+
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.exponentialRampToValueAtTime(0.08, now + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.28);
+
+        oscillator.start(now);
+        oscillator.stop(now + 0.3);
+
+        oscillator.onended = () => {
+            void context.close();
+        };
+    } catch (error) {
+        console.warn("Warning sound unavailable:", error);
+    }
+}
+
+
+
 const ExamCamera = forwardRef<ExamCameraHandle, ExamCameraProps>(function ExamCamera({
     sessionId,
     token,
@@ -74,6 +116,21 @@ const ExamCamera = forwardRef<ExamCameraHandle, ExamCameraProps>(function ExamCa
     const backupTruncatedRef = useRef(false);
 
     const [cameraReady, setCameraReady] = useState(false);
+    const [aiFaceStatus, setAiFaceStatus] = useState(
+        "AI face detection initializing..."
+    );
+    const [faceWarningSeconds, setFaceWarningSeconds] =
+        useState<number | null>(null);
+
+    const [faceWarningVisible, setFaceWarningVisible] =
+        useState(false);
+
+    const faceWarningShownAtRef = useRef<number | null>(null);
+
+    const [, setPhoneStatus] =
+        useState("Phone detection initializing...");
+    const [phoneAlert, setPhoneAlert] = useState(false);
+    const phoneAlertUntilRef = useRef(0);
     const [starting, setStarting] = useState(false);
     const [recording, setRecording] = useState(false);
     const [finalizing, setFinalizing] = useState(false);
@@ -551,6 +608,7 @@ const ExamCamera = forwardRef<ExamCameraHandle, ExamCameraProps>(function ExamCa
 
 
     // Start the camera after React finishes mounting.
+
     useEffect(() => {
         if (!autoStart) return;
 
@@ -566,9 +624,444 @@ const ExamCamera = forwardRef<ExamCameraHandle, ExamCameraProps>(function ExamCa
         return () => window.clearTimeout(timer);
     }, [autoStart]);
 
-    // Recording is now started directly by startCamera() once the
-    // preview stream is ready; no extra React effect is required.
 
+    // AI FACE DETECTION — Phase 2
+    // 10s face absence / 5s multiple faces.
+    // Observations do not terminate examinations.
+    useEffect(() => {
+        if (!cameraReady) return;
+
+        let cancelled = false;
+        let intervalId: number | undefined;
+
+        let currentCondition = "";
+        let conditionStartedAt = 0;
+        let eventSent = false;
+        let lastFaceBeepAt = 0;
+
+        async function sendAIObservation(
+            eventType: "ai_face_absent" | "ai_multiple_faces",
+            durationSeconds: number,
+            faceCount: number
+        ) {
+            try {
+                const response = await fetch(
+                    `${API}/api/exams/${encodeURIComponent(sessionId)}/proctoring/events`,
+                    {
+                        method: "POST",
+                        headers: {
+                            Authorization: `Bearer ${token}`,
+                            "Content-Type": "application/json",
+                        },
+                        body: JSON.stringify({
+                            event_type: eventType,
+                            details: {
+                                source: "mediapipe",
+                                duration_seconds: durationSeconds,
+                                face_count: faceCount,
+                                message:
+                                    eventType === "ai_face_absent"
+                                        ? "Face not detected continuously"
+                                        : "Multiple faces detected continuously",
+                            },
+                        }),
+                    }
+                );
+
+                if (!response.ok) {
+                    throw new Error(
+                        `AI event upload failed: ${response.status}`
+                    );
+                }
+
+                console.log("AI observation saved:", eventType);
+            } catch (error) {
+                console.error(
+                    "Could not save AI observation:",
+                    error
+                );
+            }
+        }
+
+        async function startAIDetection() {
+            try {
+                setAiFaceStatus("AI model loading...");
+
+                await initializeFaceDetector();
+
+                if (cancelled) return;
+
+                setAiFaceStatus("AI face detection ready");
+
+                intervalId = window.setInterval(() => {
+                    const video = videoRef.current;
+
+                    // Don't measure absence when the browser
+                    // or camera preview isn't available.
+
+                    if (
+                        document.visibilityState !== "visible" ||
+                        !video ||
+                        video.readyState < 2 ||
+                        video.paused ||
+                        video.ended
+                    ) {
+                        setFaceWarningSeconds(null);
+                        lastFaceBeepAt = 0;
+                        currentCondition = "";
+                        conditionStartedAt = 0;
+                        eventSent = false;
+                        return;
+                    }
+
+
+                    try {
+                        const result = detectFaces(video);
+                        const faceCount = result.faceCount;
+
+                        const condition =
+                            faceCount === 0
+                                ? "absent"
+                                : faceCount > 1
+                                    ? "multiple"
+                                    : "normal";
+
+                        const now = performance.now();
+
+                        if (condition !== currentCondition) {
+                            currentCondition = condition;
+                            conditionStartedAt = now;
+                            eventSent = false;
+                            lastFaceBeepAt = 0;
+
+                            if (condition !== "absent") {
+                                setFaceWarningSeconds(null);
+                            }
+                        }
+
+                        const durationSeconds = Math.floor(
+                            (now - conditionStartedAt) / 1000
+                        );
+
+                        if (condition === "normal") {
+                            setAiFaceStatus(
+                                "AI: One face detected"
+                            );
+                            return;
+                        }
+
+                        if (condition === "absent") {
+
+
+                            if (durationSeconds >= 10) {
+                                setFaceWarningSeconds(durationSeconds);
+                            } else {
+                                setFaceWarningSeconds(null);
+                            }
+
+                            // Beep once at 10 seconds.
+                            if (durationSeconds >= 5 && lastFaceBeepAt === 0) {
+                                playFaceWarningTone();
+                                lastFaceBeepAt = 5;
+                            }
+
+                            // One reminder at 20 seconds, not every second.
+                            if (durationSeconds >= 20 && lastFaceBeepAt === 5) {
+                                playFaceWarningTone();
+                                lastFaceBeepAt = 20;
+                            }
+
+                            setAiFaceStatus(
+                                durationSeconds < 5
+                                    ? "AI: No face detected"
+                                    : `AI: No face (${durationSeconds}s)`
+                            );
+
+                            if (
+                                durationSeconds >= 5 &&
+                                !eventSent
+                            ) {
+                                eventSent = true;
+
+                                setAiFaceStatus(
+                                    "AI: Face absent — observation logged"
+                                );
+
+                                void sendAIObservation(
+                                    "ai_face_absent",
+                                    durationSeconds,
+                                    0
+                                );
+                            }
+
+                            return;
+                        }
+
+                        setAiFaceStatus(
+                            `AI: ${faceCount} faces (${durationSeconds}s)`
+                        );
+
+                        if (
+                            durationSeconds >= 5 &&
+                            !eventSent
+                        ) {
+                            eventSent = true;
+
+                            setAiFaceStatus(
+                                "AI: Multiple faces — observation logged"
+                            );
+
+                            void sendAIObservation(
+                                "ai_multiple_faces",
+                                durationSeconds,
+                                faceCount
+                            );
+                        }
+                    } catch (error) {
+                        console.error(
+                            "AI detection error:",
+                            error
+                        );
+
+                        currentCondition = "";
+                        conditionStartedAt = 0;
+                        eventSent = false;
+
+                        setAiFaceStatus(
+                            "AI detection unavailable"
+                        );
+                    }
+                }, 1000);
+            } catch (error) {
+                console.error(
+                    "AI initialization error:",
+                    error
+                );
+
+                if (!cancelled) {
+                    setAiFaceStatus(
+                        "AI model failed to load"
+                    );
+                }
+            }
+        }
+
+        void startAIDetection();
+
+        return () => {
+            cancelled = true;
+
+            if (intervalId !== undefined) {
+                window.clearInterval(intervalId);
+            }
+        };
+    }, [cameraReady, sessionId, token]);
+
+
+
+
+    // Keep the yellow face warning visible for at least 10 seconds.
+    useEffect(() => {
+        if (faceWarningSeconds !== null) {
+            if (faceWarningShownAtRef.current === null) {
+                faceWarningShownAtRef.current = Date.now();
+            }
+
+            setFaceWarningVisible(true);
+            return;
+        }
+
+        if (faceWarningShownAtRef.current === null) {
+            return;
+        }
+
+        const elapsed =
+            Date.now() - faceWarningShownAtRef.current;
+
+        const remaining = Math.max(0, 10_000 - elapsed);
+
+        const timer = window.setTimeout(() => {
+            setFaceWarningVisible(false);
+            faceWarningShownAtRef.current = null;
+        }, remaining);
+
+        return () => window.clearTimeout(timer);
+    }, [faceWarningSeconds]);
+
+
+    // MOBILE PHONE DETECTION — Phase 3
+    useEffect(() => {
+        if (!cameraReady) return;
+
+        let cancelled = false;
+        let timer: number | undefined;
+        let busy = false;
+
+        let positiveChecks = 0;
+        let negativeChecks = 0;
+        let eventSent = false;
+
+        async function startPhoneDetection() {
+            try {
+                setPhoneStatus("Loading phone detector...");
+
+                await initializePhoneDetector();
+
+                if (cancelled) return;
+
+                setPhoneStatus("Phone detector ready");
+
+                timer = window.setInterval(async () => {
+                    const video = videoRef.current;
+
+                    if (
+                        cancelled ||
+                        busy ||
+                        document.visibilityState !== "visible" ||
+                        !video ||
+                        video.readyState < 2 ||
+                        video.paused ||
+                        video.ended
+                    ) {
+                        return;
+                    }
+
+                    busy = true;
+
+                    try {
+                        const phoneVisible =
+                            await detectPhone(video);
+
+                        if (cancelled) return;
+
+                        if (phoneVisible) {
+                            positiveChecks++;
+                            negativeChecks = 0;
+
+                            if (!eventSent) {
+                                setPhoneStatus(
+                                    "📱 Mobile phone detected — checking..."
+                                );
+                            }
+
+                            if (
+                                positiveChecks >= 2 &&
+                                !eventSent
+                            ) {
+                                eventSent = true;
+
+                                const response = await fetch(
+                                    `${API}/api/exams/${encodeURIComponent(sessionId)}/proctoring/events`,
+                                    {
+                                        method: "POST",
+                                        headers: {
+                                            Authorization: `Bearer ${token}`,
+                                            "Content-Type": "application/json",
+                                        },
+                                        body: JSON.stringify({
+                                            event_type:
+                                                "ai_mobile_phone",
+                                            details: {
+                                                source: "coco_ssd",
+                                                confirmation_checks: 2,
+                                                message:
+                                                    "Mobile phone visible in webcam",
+                                            },
+                                        }),
+                                    }
+                                );
+
+
+                                if (!response.ok) {
+                                    throw new Error(
+                                        `Phone event upload failed: ${response.status}`
+                                    );
+                                }
+
+                                if (cancelled) return;
+
+                                // Show popup only after successful backend saving.
+                                phoneAlertUntilRef.current = Date.now() + 10_000;
+
+                                setPhoneAlert(true);
+                                playFaceWarningTone();
+
+                                console.log(
+                                    "AI observation saved: ai_mobile_phone"
+                                );
+
+                            }
+                        } else {
+                            negativeChecks++;
+                            positiveChecks = 0;
+
+                            if (negativeChecks >= 2) {
+                                eventSent = false;
+                            }
+
+                            if (
+                                negativeChecks >= 2 &&
+                                Date.now() >= phoneAlertUntilRef.current
+                            ) {
+                                setPhoneAlert(false);
+                            }
+                        }
+                    } catch (error) {
+                        console.error(
+                            "Phone detection error:",
+                            error
+                        );
+                        if (!cancelled) {
+                            setPhoneStatus(
+                                "Phone detection unavailable"
+                            );
+                        }
+                    } finally {
+                        busy = false;
+                    }
+                }, 1000);
+            } catch (error) {
+                console.error(
+                    "Phone model loading failed:",
+                    error
+                );
+
+                if (!cancelled) {
+                    setPhoneStatus(
+                        "Phone detector failed to load"
+                    );
+                }
+            }
+        }
+
+        void startPhoneDetection();
+
+        return () => {
+            cancelled = true;
+
+            if (timer !== undefined) {
+                window.clearInterval(timer);
+            }
+        };
+    }, [cameraReady, sessionId, token]);
+
+
+    useEffect(() => {
+        if (!phoneAlert) return;
+
+        const remaining = Math.max(
+            0,
+            phoneAlertUntilRef.current - Date.now()
+        );
+
+        const timeout = window.setTimeout(() => {
+            setPhoneAlert(false);
+        }, remaining);
+
+        return () => {
+            window.clearTimeout(timeout);
+        };
+    }, [phoneAlert]);
 
 
     return (
@@ -602,6 +1095,78 @@ const ExamCamera = forwardRef<ExamCameraHandle, ExamCameraProps>(function ExamCa
                                 : "Camera unavailable"}
                 </span>
             </div>
+
+
+            <div
+                style={{
+                    marginTop: 10,
+                    padding: "10px 12px",
+                    borderRadius: 8,
+                    background: "#f3efff",
+                    color: "#5131a5",
+                    fontWeight: 600,
+                    fontSize: 13,
+                }}
+            >
+                🤖 {aiFaceStatus}
+            </div>
+
+
+            {phoneAlert && (
+                <div
+                    role="alert"
+                    style={{
+                        marginTop: 12,
+                        padding: "14px 16px",
+                        background: "#fff1f2",
+                        border: "2px solid #e11d48",
+                        color: "#9f1239",
+                        borderRadius: 10,
+                        fontWeight: 600,
+                    }}
+                >
+                    <div style={{ fontSize: 16 }}>
+                        ⚠️ Mobile Phone Detected
+                    </div>
+
+                    <p style={{ margin: "8px 0 0" }}>
+                        A mobile phone has been detected
+                        in your camera view.
+                        This observation has been recorded
+                        for teacher review.
+                    </p>
+                </div>
+            )}
+
+
+            {faceWarningVisible && (
+                <div
+                    role="alert"
+                    style={{
+                        marginTop: 12,
+                        padding: "14px 16px",
+                        background: "#fff3cd",
+                        color: "#664d03",
+                        border: "2px solid #ffca2c",
+                        borderRadius: 10,
+                        fontWeight: 600,
+                    }}
+                >
+                    <div style={{ fontSize: 16 }}>
+                        ⚠️ Face Not Detected
+                    </div>
+
+                    <p style={{ margin: "8px 0 0" }}>
+                        {faceWarningSeconds !== null
+                            ? `Your face has not been detected for ${faceWarningSeconds} seconds.`
+                            : "Your face was temporarily outside the camera frame."}
+                        Please sit properly in front of your
+                        webcam and make sure your face is
+                        clearly visible.
+                    </p>
+                </div>
+            )}
+
 
             {failedCount > 0 && (
                 <p role="alert" className="student-recording-error">

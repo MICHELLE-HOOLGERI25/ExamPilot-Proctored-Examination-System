@@ -33,6 +33,7 @@ import {
 
 import "./App.css";
 import ExamCamera, { type ExamCameraHandle } from "./ExamCamera";
+import { warmUpPhoneDetector } from "./PhoneDetector";
 
 // ============================================================
 // CONFIGURATION
@@ -182,6 +183,8 @@ export default function App() {
   const [pendingExam, setPendingExam] = useState<Exam | null>(null);
   const [examConsent, setExamConsent] = useState(false);
   const [previewReady, setPreviewReady] = useState(false);
+  const [phoneModelState, setPhoneModelState] =
+    useState<"idle" | "loading" | "ready" | "error">("idle");
   const previewStreamRef = useRef<MediaStream | null>(null);
   const previewVideoRef = useRef<HTMLVideoElement>(null);
 
@@ -197,6 +200,37 @@ export default function App() {
     element.srcObject = previewStreamRef.current;
     void element.play().catch(error => console.warn("Preview playback:", error));
   }, [view, previewReady]);
+
+
+  useEffect(() => {
+    if (view !== "consent" && view !== "prepare") return;
+
+    let cancelled = false;
+
+    setPhoneModelState("loading");
+
+    void warmUpPhoneDetector()
+      .then(() => {
+        if (!cancelled) {
+          setPhoneModelState("ready");
+        }
+      })
+      .catch((error) => {
+        console.error(
+          "Phone detector warm-up failed:",
+          error
+        );
+
+        if (!cancelled) {
+          setPhoneModelState("error");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [view]);
+
   const [recordingActive, setRecordingActive] = useState(false);
   const examCameraRef = useRef<ExamCameraHandle | null>(null);
   const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
@@ -261,6 +295,36 @@ export default function App() {
 
   const [recordingLoading, setRecordingLoading] =
     useState<string | null>(null);
+
+
+  const recordingVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  const pendingRecordingSeekRef = useRef<number | null>(null);
+
+  function seekRecordingVideo(seconds: number) {
+    const video = recordingVideoRef.current;
+
+    if (!video || video.readyState < 1) {
+      pendingRecordingSeekRef.current = seconds;
+      return;
+    }
+
+    const target = Math.max(
+      0,
+      Number.isFinite(video.duration)
+        ? Math.min(seconds, Math.max(0, video.duration - 0.1))
+        : seconds
+    );
+
+    try {
+      video.currentTime = target;
+      pendingRecordingSeekRef.current = null;
+    } catch (error) {
+      console.warn("Could not seek recording yet:", error);
+      pendingRecordingSeekRef.current = seconds;
+    }
+  }
+
 
   useEffect(() => {
     return () => {
@@ -977,8 +1041,27 @@ export default function App() {
   }
 
 
-  async function watchRecording(sessionId: string) {
+  async function watchRecording(
+    sessionId: string,
+    seekSeconds?: number
+  ) {
     if (recordingLoading) return;
+
+
+    if (
+      recordingViewer?.sessionId === sessionId &&
+      seekSeconds !== undefined
+    ) {
+      seekRecordingVideo(seekSeconds);
+      return;
+    }
+
+    if (seekSeconds !== undefined) {
+      pendingRecordingSeekRef.current = seekSeconds;
+    } else {
+      pendingRecordingSeekRef.current = null;
+    }
+
 
     // Click again to close the current recording.
     if (recordingViewer?.sessionId === sessionId) {
@@ -2939,7 +3022,11 @@ export default function App() {
                                             <th style={{ textAlign: "left", padding: 12 }}>Percentage</th>
                                             <th style={{ textAlign: "left", padding: 12 }}>Status</th>
                                             <th style={{ textAlign: "left", padding: 12 }}>
-                                              Warnings
+                                              Browser Warnings
+                                            </th>
+
+                                            <th style={{ textAlign: "left", padding: 12 }}>
+                                              AI Observations
                                             </th>
                                             <th style={{ textAlign: "left", padding: 12 }}>
                                               Recording
@@ -2955,18 +3042,83 @@ export default function App() {
                                               r.session_id || i
                                             );
 
-                                            const isExpanded =
-                                              expandedWarningSession === sessionId;
+                                            const isBrowserExpanded =
+                                              expandedWarningSession === `${sessionId}:browser`;
+
+                                            const isAiExpanded =
+                                              expandedWarningSession === `${sessionId}:ai`;
+
+                                            const isExpanded = isBrowserExpanded || isAiExpanded;
 
                                             const warningCount =
                                               Number(r.warning_count || 0);
 
-                                            const eventCount =
-                                              Number(r.security_event_count || 0);
 
                                             const events = Array.isArray(r.proctoring_events)
                                               ? r.proctoring_events
                                               : [];
+
+
+                                            const aiEvents = events.filter(
+                                              (event: any) =>
+                                                String(event.event_type || "").startsWith("ai_")
+                                            );
+
+
+                                            const examStartMs = r.started_at
+                                              ? new Date(r.started_at).getTime()
+                                              : NaN;
+
+                                            const getVideoSeconds = (event: any): number | null => {
+                                              const eventMs = new Date(event.occurred_at || "").getTime();
+
+                                              if (
+                                                !Number.isFinite(examStartMs) ||
+                                                !Number.isFinite(eventMs)
+                                              ) {
+                                                return null;
+                                              }
+
+                                              // Face events are logged after a detection threshold.
+                                              // Rewind to approximately when the observation began.
+                                              const rewindSeconds =
+                                                event.event_type === "ai_face_absent" ? 5 :
+                                                  event.event_type === "ai_multiple_faces" ? 5 :
+                                                    0;
+
+                                              return Math.max(
+                                                0,
+                                                (eventMs - examStartMs) / 1000 - rewindSeconds
+                                              );
+                                            };
+
+                                            const formatVideoTime = (seconds: number): string => {
+                                              const whole = Math.floor(seconds);
+                                              const minutes = Math.floor(whole / 60);
+                                              const remaining = whole % 60;
+
+                                              return `${String(minutes).padStart(2, "0")}:${String(
+                                                remaining
+                                              ).padStart(2, "0")}`;
+                                            };
+
+
+                                            const browserEvents = events.filter(
+                                              (event: any) =>
+                                                !String(event.event_type || "").startsWith("ai_")
+                                            );
+
+                                            const aiEventLabels: Record<string, string> = {
+                                              ai_face_absent: "Face Absent",
+                                              ai_multiple_faces: "Multiple Faces Detected",
+                                              ai_mobile_phone: "Mobile Phone Detected",
+                                            };
+
+                                            const getEventLabel = (event: any) =>
+                                              aiEventLabels[event.event_type] ||
+                                              String(event.event_type || "Unknown Event")
+                                                .replaceAll("_", " ");
+
 
                                             return (
                                               <React.Fragment key={sessionId}>
@@ -3005,11 +3157,13 @@ export default function App() {
                                                     <button
                                                       type="button"
                                                       className="secondary"
-                                                      aria-expanded={isExpanded}
-                                                      aria-label={`View warnings for ${r.student_name || "student"}`}
+                                                      aria-expanded={isBrowserExpanded}
+                                                      aria-label={`View browser warnings for ${r.student_name || "student"}`}
                                                       onClick={() =>
                                                         setExpandedWarningSession(
-                                                          isExpanded ? null : sessionId
+                                                          isBrowserExpanded
+                                                            ? null
+                                                            : `${sessionId}:browser`
                                                         )
                                                       }
                                                       style={{
@@ -3029,6 +3183,41 @@ export default function App() {
                                                       {warningCount}
                                                     </button>
                                                   </td>
+
+
+                                                  <td style={{ padding: 12 }}>
+                                                    <button
+                                                      type="button"
+                                                      className="secondary"
+                                                      aria-expanded={isAiExpanded}
+                                                      aria-label={`View AI observations for ${r.student_name || "student"}`}
+                                                      onClick={() =>
+                                                        setExpandedWarningSession(
+                                                          isAiExpanded
+                                                            ? null
+                                                            : `${sessionId}:ai`
+                                                        )
+                                                      }
+                                                      style={{
+                                                        display: "inline-flex",
+                                                        alignItems: "center",
+                                                        gap: 8,
+                                                        whiteSpace: "nowrap",
+                                                      }}
+                                                    >
+                                                      <BrainCircuit
+                                                        size={16}
+                                                        color={
+                                                          aiEvents.length > 0
+                                                            ? "#7c3aed"
+                                                            : "#64748b"
+                                                        }
+                                                      />
+
+                                                      {aiEvents.length}
+                                                    </button>
+                                                  </td>
+
 
                                                   <td style={{ padding: 12 }}>
                                                     <button
@@ -3054,7 +3243,7 @@ export default function App() {
                                                 {recordingViewer?.sessionId === sessionId && (
                                                   <tr>
                                                     <td
-                                                      colSpan={7}
+                                                      colSpan={8}
                                                       style={{
                                                         padding: 18,
                                                         background: "#f8fafc",
@@ -3070,6 +3259,17 @@ export default function App() {
                                                         controls
                                                         playsInline
                                                         preload="metadata"
+
+
+                                                        ref={recordingVideoRef}
+                                                        onLoadedMetadata={() => {
+                                                          const seconds = pendingRecordingSeekRef.current;
+
+                                                          if (seconds !== null) {
+                                                            seekRecordingVideo(seconds);
+                                                          }
+                                                        }}
+
                                                         style={{
                                                           display: "block",
                                                           width: "100%",
@@ -3095,65 +3295,179 @@ export default function App() {
                                                         background: "#fafbff",
                                                       }}
                                                     >
+
+
                                                       <div className="proctor-card">
-                                                        <div className="proctor-card-header">
-                                                          <h4>Proctoring history</h4>
-                                                          <p>Security activity recorded during the examination.</p>
-                                                        </div>
 
-                                                        <div className="proctor-stats">
-                                                          <div className="proctor-stat">
-                                                            <span className="proctor-stat-label">Warnings</span>
-                                                            <strong>{warningCount} / 3</strong>
-                                                          </div>
+                                                        {/* AI OBSERVATIONS — ONLY WHEN AI IS OPEN */}
+                                                        {isAiExpanded && (
+                                                          <>
+                                                            <div className="proctor-card-header">
+                                                              <h4>🤖 AI Observations</h4>
+                                                              <p>
+                                                                {aiEvents.length} AI observation(s)
+                                                                recorded during this examination.
+                                                                All detections require teacher review.
+                                                              </p>
+                                                            </div>
 
-                                                          <div className="proctor-stat">
-                                                            <span className="proctor-stat-label">Incidents</span>
-                                                            <strong>{Number(r.incident_count ?? eventCount)}</strong>
-                                                          </div>
+                                                            {aiEvents.length === 0 ? (
+                                                              <p>No AI observations recorded.</p>
+                                                            ) : (
+                                                              <div className="proctor-event-list">
+                                                                {aiEvents.map((event: any, index: number) => (
+                                                                  <div
+                                                                    key={event.id ?? index}
+                                                                    className="proctor-event-item"
+                                                                    style={{
+                                                                      borderLeft: "4px solid #7c3aed",
+                                                                      paddingLeft: 12,
+                                                                      marginBottom: 12,
+                                                                    }}
+                                                                  >
+                                                                    <div className="proctor-event-top">
+                                                                      <strong>
+                                                                        {getEventLabel(event)}
+                                                                      </strong>
 
-                                                          <div className="proctor-stat">
-                                                            <span className="proctor-stat-label">Recorded events</span>
-                                                            <strong>{eventCount}</strong>
-                                                          </div>
-                                                        </div>
+                                                                      <span className="proctor-event-time">
+                                                                        {event.occurred_at
+                                                                          ? new Date(
+                                                                            event.occurred_at
+                                                                          ).toLocaleString()
+                                                                          : "Time unavailable"}
+                                                                      </span>
+                                                                    </div>
 
-                                                        {r.proctoring_terminated && (
-                                                          <div className="proctor-alert">
-                                                            Examination automatically terminated after reaching the security limit.
-                                                          </div>
-                                                        )}
+                                                                    <p style={{ margin: "6px 0" }}>
+                                                                      {event.message ||
+                                                                        "AI observation recorded"}
+                                                                    </p>
 
-                                                        {events.length > 0 ? (
-                                                          <div className="proctor-event-list">
-                                                            {events.map((event: any, index: number) => (
-                                                              <div
-                                                                key={`${event.event_type}-${event.occurred_at ?? index}`}
-                                                                className="proctor-event-item"
-                                                              >
-                                                                <div className="proctor-event-top">
-                                                                  <span className="proctor-event-type">
-                                                                    {event.event_type?.replaceAll("_", " ")}
-                                                                  </span>
-                                                                  <span className="proctor-event-time">
-                                                                    {event.occurred_at
-                                                                      ? new Date(event.occurred_at).toLocaleString()
-                                                                      : "Time unavailable"}
-                                                                  </span>
-                                                                </div>
 
-                                                                <div className="proctor-event-message">
-                                                                  {event.message || event.detail || "Security event recorded during the examination."}
-                                                                </div>
+                                                                    {(() => {
+                                                                      const videoSeconds = getVideoSeconds(event);
+
+                                                                      if (videoSeconds === null) {
+                                                                        return (
+                                                                          <small style={{ color: "#64748b" }}>
+                                                                            Recording position unavailable
+                                                                          </small>
+                                                                        );
+                                                                      }
+
+                                                                      return (
+                                                                        <button
+                                                                          type="button"
+                                                                          className="secondary"
+                                                                          disabled={recordingLoading !== null}
+                                                                          onClick={() =>
+                                                                            void watchRecording(sessionId, videoSeconds)
+                                                                          }
+                                                                          style={{
+                                                                            marginTop: 8,
+                                                                            display: "inline-flex",
+                                                                            alignItems: "center",
+                                                                            gap: 6,
+                                                                            fontSize: 13,
+                                                                          }}
+                                                                        >
+                                                                          ▶ Watch near {formatVideoTime(videoSeconds)}
+                                                                        </button>
+                                                                      );
+                                                                    })()}
+
+
+                                                                    {typeof event.details?.duration_seconds ===
+                                                                      "number" && (
+                                                                        <div>
+                                                                          <small>
+                                                                            Duration:{" "}
+                                                                            {event.details.duration_seconds}s
+                                                                          </small>
+                                                                        </div>
+                                                                      )}
+
+                                                                    {typeof event.details?.face_count ===
+                                                                      "number" && (
+                                                                        <div>
+                                                                          <small>
+                                                                            Faces detected:{" "}
+                                                                            {event.details.face_count}
+                                                                          </small>
+                                                                        </div>
+                                                                      )}
+                                                                  </div>
+                                                                ))}
                                                               </div>
-                                                            ))}
-                                                          </div>
-                                                        ) : (
-                                                          <div className="proctor-empty">
-                                                            No proctoring events were recorded for this attempt.
-                                                          </div>
+                                                            )}
+                                                          </>
                                                         )}
+
+                                                        {/* BROWSER WARNINGS — ONLY WHEN BROWSER IS OPEN */}
+                                                        {isBrowserExpanded && (
+                                                          <>
+                                                            <div className="proctor-card-header">
+                                                              <h4>🛡️ Browser Security Warnings</h4>
+                                                              <p>
+                                                                {warningCount} counted browser warning(s)
+                                                                during this examination.
+                                                              </p>
+                                                            </div>
+
+                                                            {r.proctoring_terminated && (
+                                                              <div className="proctor-alert">
+                                                                Examination terminated after the
+                                                                browser-security incident limit
+                                                                was reached.
+                                                              </div>
+                                                            )}
+
+                                                            {browserEvents.length === 0 ? (
+                                                              <p>No browser-security events recorded.</p>
+                                                            ) : (
+                                                              <div className="proctor-event-list">
+                                                                {browserEvents.map(
+                                                                  (event: any, index: number) => (
+                                                                    <div
+                                                                      key={event.id ?? index}
+                                                                      className="proctor-event-item"
+                                                                      style={{
+                                                                        borderLeft:
+                                                                          "4px solid #f59e0b",
+                                                                        paddingLeft: 12,
+                                                                        marginBottom: 12,
+                                                                      }}
+                                                                    >
+                                                                      <div className="proctor-event-top">
+                                                                        <strong>
+                                                                          {getEventLabel(event)}
+                                                                        </strong>
+
+                                                                        <span className="proctor-event-time">
+                                                                          {event.occurred_at
+                                                                            ? new Date(
+                                                                              event.occurred_at
+                                                                            ).toLocaleString()
+                                                                            : "Time unavailable"}
+                                                                        </span>
+                                                                      </div>
+
+                                                                      <p style={{ margin: "6px 0" }}>
+                                                                        {event.message ||
+                                                                          "Browser event recorded"}
+                                                                      </p>
+                                                                    </div>
+                                                                  )
+                                                                )}
+                                                              </div>
+                                                            )}
+                                                          </>
+                                                        )}
+
                                                       </div>
+
+
                                                     </td>
                                                   </tr>
                                                 )}
@@ -4019,10 +4333,28 @@ export default function App() {
             </div>
 
             <p>When you click Start, ExamPilot will enter fullscreen, create your timed attempt, and begin webcam/microphone recording automatically.</p>
+
+            <p role="status" style={{ marginTop: 12 }}>
+              {phoneModelState === "loading"
+                ? "⏳ Preparing AI mobile-phone detector..."
+                : phoneModelState === "ready"
+                  ? "✅ AI mobile-phone detector ready"
+                  : phoneModelState === "error"
+                    ? "⚠ Mobile-phone detector unavailable."
+                    : ""}
+            </p>
+
             <div className="student-actions">
               <button
                 type="button" className="primary"
-                disabled={!examConsent || !previewReady || busy}
+
+                disabled={
+                  !examConsent ||
+                  !previewReady ||
+                  busy ||
+                  phoneModelState === "loading"
+                }
+
                 onClick={() => void enterExamFullscreen()}
               >
                 {busy ? "Starting examination..." : "Enter Fullscreen and Start Exam"}
