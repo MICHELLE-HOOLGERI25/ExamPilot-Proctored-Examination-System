@@ -514,6 +514,12 @@ def _hydrate_sessions() -> None:
                 sessions[attempt.id] = attempt.session_state
 
 
+# Initialize database tables before restoring sessions
+from backend.app import models
+from backend.app.database import Base, engine
+
+Base.metadata.create_all(bind=engine)
+
 _hydrate_sessions()
 
 def load_session(session_id: str) -> dict[str, Any]:
