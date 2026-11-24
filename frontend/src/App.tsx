@@ -58,7 +58,15 @@ type User = {
 
 type Exam = {
   session_id: string;
+  proctoring_mode?: "camera" | "browser" | null;
+  browser_only_allowed?: boolean;
+  attempt_count?: number;
   assignment_id?: string;
+  subject?: string;
+  topic?: string;
+  difficulty?: string;
+  division?: string;
+  target_division?: string;
   status?: string;
   total_questions?: number;
   answered_questions?: number;
@@ -183,6 +191,9 @@ export default function App() {
   const [pendingExam, setPendingExam] = useState<Exam | null>(null);
   const [examConsent, setExamConsent] = useState(false);
   const [previewReady, setPreviewReady] = useState(false);
+  const [proctoringMode, setProctoringMode] = useState<
+    "camera" | "browser"
+  >("camera");
   const [phoneModelState, setPhoneModelState] =
     useState<"idle" | "loading" | "ready" | "error">("idle");
   const previewStreamRef = useRef<MediaStream | null>(null);
@@ -204,6 +215,13 @@ export default function App() {
 
   useEffect(() => {
     if (view !== "consent" && view !== "prepare") return;
+
+
+    if (proctoringMode === "browser") {
+      setPhoneModelState("idle");
+      return;
+    }
+
 
     let cancelled = false;
 
@@ -229,7 +247,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [view]);
+  }, [view, proctoringMode]);
 
   const [recordingActive, setRecordingActive] = useState(false);
   const examCameraRef = useRef<ExamCameraHandle | null>(null);
@@ -404,12 +422,20 @@ export default function App() {
         if (data.exam_terminated) {
           examClosedRef.current = true;
 
+
           setSecurityNotice(
-            "Exam terminated. Finishing recording upload..."
+            proctoringMode === "browser"
+              ? "Exam terminated due to security violations."
+              : "Exam terminated. Finishing recording upload..."
           );
 
+
+
           const recordingSaved =
-            await examCameraRef.current?.finishRecording();
+            proctoringMode === "camera"
+              ? await examCameraRef.current?.finishRecording()
+              : null;
+
 
           setResult({
             ...(data.termination_result || {}),
@@ -419,11 +445,17 @@ export default function App() {
           setExamFullscreen(false);
           setView("result");
 
+
+
           setMessage(
-            recordingSaved === true
-              ? "⛔ Exam terminated. Recording uploaded successfully."
-              : "⛔ Exam terminated. Complete recording upload was not confirmed."
+            proctoringMode === "browser"
+              ? "⛔ Examination terminated due to security violations."
+              : recordingSaved === true
+                ? "⛔ Examination terminated. Recording uploaded successfully."
+                : "⛔ Examination terminated. Recording upload was not confirmed."
           );
+
+
 
           if (document.fullscreenElement) {
             try {
@@ -520,7 +552,7 @@ export default function App() {
         }
       }
     },
-    [view, active?.session_id, token]
+    [view, active?.session_id, token, proctoringMode]
   );
 
   // Fullscreen and tab visibility monitoring.
@@ -585,12 +617,34 @@ export default function App() {
   // The actual server attempt begins only after the student clicks Start.
   async function enterExamFullscreen() {
     if (
-      view !== "prepare" || !pendingExam || !examConsent ||
-      !previewReady || busy ||
-      !previewStreamRef.current?.getVideoTracks().some(t => t.readyState === "live") ||
-      !previewStreamRef.current?.getAudioTracks().some(t => t.readyState === "live")
+      view !== "prepare" ||
+      !pendingExam ||
+      !examConsent ||
+      busy ||
+      (
+        proctoringMode === "camera" &&
+        (
+          !previewReady ||
+          !previewStreamRef.current?.getVideoTracks().some(
+            t => t.readyState === "live"
+          ) ||
+          !previewStreamRef.current?.getAudioTracks().some(
+            t => t.readyState === "live"
+          )
+        )
+      )
     ) {
-      setMessage("⚠ Consent and a working camera/microphone are required.");
+      setMessage("⚠ Complete the examination security check first.");
+      return;
+    }
+
+    if (
+      proctoringMode === "browser" &&
+      !pendingExam?.browser_only_allowed
+    ) {
+      setMessage(
+        "⚠ This exam does not allow browser-only proctoring. Please contact your teacher."
+      );
       return;
     }
 
@@ -744,8 +798,12 @@ export default function App() {
       setMessage("⏰ Time is over. Finalizing your examination...");
 
       try {
+
         const recordingSaved =
-          await examCameraRef.current?.finishRecording();
+          proctoringMode === "camera"
+            ? await examCameraRef.current?.finishRecording()
+            : null;
+
 
         if (cancelled) return;
         const data = await req(
@@ -765,9 +823,11 @@ export default function App() {
         examClosedRef.current = true;
         setResult(data);
         setMessage(
-          recordingSaved === true
-            ? "⏰ Time is over. Exam submitted and recording uploaded."
-            : "⚠ Time is over. Exam submitted, but complete recording upload was not confirmed."
+          proctoringMode === "browser"
+            ? "⏰ Time is over. Examination submitted successfully."
+            : recordingSaved === true
+              ? "⏰ Time is over. Exam submitted and recording uploaded."
+              : "⚠ Time is over. Exam submitted, but recording upload was not confirmed."
         );
         setExamFullscreen(false);
         setView("result");
@@ -854,7 +914,7 @@ export default function App() {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [view, active?.session_id, active?.ends_at, token]);
+  }, [view, active?.session_id, active?.ends_at, token, proctoringMode]);
 
 
   // ==========================================================
@@ -935,7 +995,7 @@ export default function App() {
       stopped = true;
       window.clearInterval(interval);
     };
-  }, [view, active?.session_id, token]);
+  }, [view, active?.session_id, active?.ends_at, token, proctoringMode]);
 
 
   // ==========================================================
@@ -984,6 +1044,36 @@ export default function App() {
   // ==========================================================
   // LOAD PROFESSOR NOTES
   // ==========================================================
+
+  async function toggleBrowserOnly(x: Exam) {
+    if (busy) return;
+
+    setBusy(true);
+    setMessage("");
+
+    try {
+      const assignmentId = x.assignment_id || x.session_id;
+
+      await req(
+        `/api/teacher/exams/${encodeURIComponent(assignmentId)}/browser-only`,
+        token,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            allowed: !x.browser_only_allowed,
+          }),
+        }
+      );
+
+      await load();
+
+      setMessage("✓ Browser-only examination setting updated.");
+    } catch (error: any) {
+      fail(error);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function loadNotes() {
     if (!token || user?.role !== "teacher") return;
@@ -1088,7 +1178,7 @@ export default function App() {
 
         if (response.status === 404) {
           throw new Error(
-            "No recording has been uploaded for this attempt."
+            "No recording available. This may be a browser-only examination."
           );
         }
 
@@ -1727,7 +1817,10 @@ export default function App() {
         token,
         {
           method: "POST",
-          body: JSON.stringify({ consent_accepted: true }),
+          body: JSON.stringify({
+            consent_accepted: true,
+            proctoring_mode: proctoringMode,
+          }),
         }
       );
 
@@ -1994,10 +2087,19 @@ export default function App() {
 
       if (examClosedRef.current) return;
 
-      setMessage("Finishing recording and uploading final video...");
+
+      setMessage(
+        proctoringMode === "browser"
+          ? "Submitting your examination..."
+          : "Finishing recording and uploading final video..."
+      );
+
 
       const recordingSaved =
-        await examCameraRef.current?.finishRecording();
+        proctoringMode === "camera"
+          ? await examCameraRef.current?.finishRecording()
+          : null;
+
 
       // Use the existing manual submission endpoint.
       const data = await req(
@@ -2019,9 +2121,11 @@ export default function App() {
       setView("result");
 
       setMessage(
-        recordingSaved === true
-          ? "✓ Examination submitted. Recording uploaded successfully."
-          : "⚠ Examination submitted, but complete recording upload was not confirmed."
+        proctoringMode === "browser"
+          ? "✓ Examination submitted successfully."
+          : recordingSaved === true
+            ? "✓ Examination submitted. Recording uploaded successfully."
+            : "⚠ Examination submitted, but recording upload was not confirmed."
       );
       if (document.fullscreenElement) {
         await document.exitFullscreen().catch(
@@ -2484,7 +2588,7 @@ export default function App() {
 
             <h1>
               {view === "prepare"
-                ? "Camera check"
+                ? "Security check"
                 : view === "consent"
                   ? "Examination consent"
                   : view === "create"
@@ -2704,19 +2808,33 @@ export default function App() {
                       SESSION {String(i + 1).padStart(2, "0")}
                     </small>
 
+
                     <h3>
-                      {x.questions?.[0]?.subject ||
+                      {x.subject ||
+                        x.questions?.[0]?.subject ||
                         "Course assessment"}
                     </h3>
 
+                    {x.topic && (
+                      <p
+                        style={{
+                          marginTop: 8,
+                          marginBottom: 8,
+                          fontSize: 14,
+                          lineHeight: 1.5,
+                        }}
+                      >
+                        <strong>Topic:</strong> {x.topic}
+                      </p>
+                    )}
+
                     <p>
                       {teacher
-                        ? `Assigned to Division ${(x as any).division ||
-                        (x as any).target_division ||
-                        "A"
+                        ? `Assigned to Division ${x.division || x.target_division || "Not specified"
                         }`
                         : "Complete this assessment and submit for evaluation."}
                     </p>
+
 
                     <div className="meta">
 
@@ -2734,35 +2852,46 @@ export default function App() {
 
                     </div>
 
-                    {!teacher && (
-                      <div className="exam-schedule-info">
-                        {x.scheduled_start_at && (
-                          <p>
-                            <Clock3 size={14} />
-                            Starts:{" "}
-                            {new Date(
-                              x.scheduled_start_at
-                            ).toLocaleString("en-IN")}
-                          </p>
-                        )}
-
-                        {x.scheduled_end_at && (
-                          <p>
-                            <Clock3 size={14} />
-                            Ends:{" "}
-                            {new Date(
-                              x.scheduled_end_at
-                            ).toLocaleString("en-IN")}
-                          </p>
-                        )}
-
-                        {x.duration_minutes && (
-                          <p>
-                            Duration: {x.duration_minutes} minutes
-                          </p>
-                        )}
-                      </div>
+                    {teacher && (
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={busy || Number(x.attempt_count || 0) > 0}
+                        onClick={() => void toggleBrowserOnly(x)}
+                        style={{ marginTop: 12 }}
+                      >
+                        {x.browser_only_allowed
+                          ? "✓ Browser-only allowed — Disable"
+                          : "Allow browser-only examination"}
+                      </button>
                     )}
+                    <div className="exam-schedule-info">
+                      {x.scheduled_start_at && (
+                        <p>
+                          <Clock3 size={14} />
+                          Starts:{" "}
+                          {new Date(
+                            x.scheduled_start_at
+                          ).toLocaleString("en-IN")}
+                        </p>
+                      )}
+
+                      {x.scheduled_end_at && (
+                        <p>
+                          <Clock3 size={14} />
+                          Ends:{" "}
+                          {new Date(
+                            x.scheduled_end_at
+                          ).toLocaleString("en-IN")}
+                        </p>
+                      )}
+
+                      {x.duration_minutes && (
+                        <p>
+                          Duration: {x.duration_minutes} minutes
+                        </p>
+                      )}
+                    </div>
 
                     {!teacher && (
                       <button
@@ -2770,6 +2899,7 @@ export default function App() {
                         onClick={() => {
                           setPendingExam(x);
                           releasePreviewStream();
+                          setProctoringMode("camera");
                           setExamConsent(false);
                           setRecordingActive(false);
                           setMessage("");
@@ -3219,77 +3349,82 @@ export default function App() {
                                                   </td>
 
 
+
                                                   <td style={{ padding: 12 }}>
-                                                    <button
-                                                      type="button"
-                                                      className="secondary"
-                                                      disabled={
-                                                        recordingLoading !== null
-                                                      }
-                                                      onClick={() =>
-                                                        void watchRecording(sessionId)
-                                                      }
-                                                    >
-                                                      {recordingLoading === sessionId
-                                                        ? "Loading..."
-                                                        : recordingViewer?.sessionId === sessionId
-                                                          ? "Close Recording"
-                                                          : "▶ Watch Recording"}
-                                                    </button>
+                                                    {r.proctoring_mode === "browser" ? (
+                                                      <span style={{ color: "#64748b" }}>
+                                                        No recording — browser-only exam
+                                                      </span>
+                                                    ) : (
+                                                      <button
+                                                        type="button"
+                                                        className="secondary"
+                                                        disabled={recordingLoading !== null}
+                                                        onClick={() => void watchRecording(sessionId)}
+                                                      >
+                                                        {recordingLoading === sessionId
+                                                          ? "Loading..."
+                                                          : recordingViewer?.sessionId === sessionId
+                                                            ? "Close Recording"
+                                                            : "▶ Watch Recording"}
+                                                      </button>
+                                                    )}
                                                   </td>
+
                                                 </tr>
 
 
-                                                {recordingViewer?.sessionId === sessionId && (
-                                                  <tr>
-                                                    <td
-                                                      colSpan={8}
-                                                      style={{
-                                                        padding: 18,
-                                                        background: "#f8fafc",
-                                                      }}
-                                                    >
-                                                      <h4>
-                                                        Student Examination Recording
-                                                      </h4>
-
-                                                      <video
-                                                        key={recordingViewer.url}
-                                                        src={recordingViewer.url}
-                                                        controls
-                                                        playsInline
-                                                        preload="metadata"
-
-
-                                                        ref={recordingVideoRef}
-                                                        onLoadedMetadata={() => {
-                                                          const seconds = pendingRecordingSeekRef.current;
-
-                                                          if (seconds !== null) {
-                                                            seekRecordingVideo(seconds);
-                                                          }
-                                                        }}
-
+                                                {r.proctoring_mode !== "browser" &&
+                                                  recordingViewer?.sessionId === sessionId && (
+                                                    <tr>
+                                                      <td
+                                                        colSpan={8}
                                                         style={{
-                                                          display: "block",
-                                                          width: "100%",
-                                                          maxWidth: 720,
-                                                          borderRadius: 12,
-                                                          background: "#111",
+                                                          padding: 18,
+                                                          background: "#f8fafc",
                                                         }}
-                                                      />
+                                                      >
+                                                        <h4>
+                                                          Student Examination Recording
+                                                        </h4>
+
+                                                        <video
+                                                          key={recordingViewer.url}
+                                                          src={recordingViewer.url}
+                                                          controls
+                                                          playsInline
+                                                          preload="metadata"
 
 
-                                                    </td>
-                                                  </tr>
-                                                )}
+                                                          ref={recordingVideoRef}
+                                                          onLoadedMetadata={() => {
+                                                            const seconds = pendingRecordingSeekRef.current;
+
+                                                            if (seconds !== null) {
+                                                              seekRecordingVideo(seconds);
+                                                            }
+                                                          }}
+
+                                                          style={{
+                                                            display: "block",
+                                                            width: "100%",
+                                                            maxWidth: 720,
+                                                            borderRadius: 12,
+                                                            background: "#111",
+                                                          }}
+                                                        />
+
+
+                                                      </td>
+                                                    </tr>
+                                                  )}
 
 
 
                                                 {isExpanded && (
                                                   <tr>
                                                     <td
-                                                      colSpan={7}
+                                                      colSpan={8}
                                                       style={{
                                                         padding: 16,
                                                         background: "#fafbff",
@@ -3347,6 +3482,10 @@ export default function App() {
 
                                                                     {(() => {
                                                                       const videoSeconds = getVideoSeconds(event);
+
+                                                                      if (r.proctoring_mode === "browser") {
+                                                                        return null;
+                                                                      }
 
                                                                       if (videoSeconds === null) {
                                                                         return (
@@ -4199,7 +4338,7 @@ export default function App() {
 
             <div className="student-stepper">
               <span className="step-current">1 · Consent</span>
-              <span>2 · Camera check</span>
+              <span>2 · Security check</span>
               <span>3 · Examination</span>
             </div>
 
@@ -4209,14 +4348,17 @@ export default function App() {
                 <strong>Secure examination monitoring</strong>
               </div>
 
+
               <p>
-                Your webcam and microphone will be recorded only
-                after you start the examination.
+                ExamPilot monitors fullscreen exits, tab switching
+                and restricted browser actions during the examination.
               </p>
               <p>
-                The recording is uploaded to ExamPilot and is
-                accessible to the authorized examiner.
+                When a camera and microphone are available and
+                required, AI monitoring and recording are also used.
+                Approved camera-free exams use browser-only monitoring.
               </p>
+
             </div>
 
             <label className="student-consent-choice"
@@ -4230,8 +4372,9 @@ export default function App() {
               />
 
               <span>
-                I consent to webcam and microphone recording
-                throughout this examination.
+                I understand and agree to the examination monitoring
+                rules, including browser-security logging and
+                camera recording when required.
               </span>
             </label>
 
@@ -4240,40 +4383,74 @@ export default function App() {
                 className="primary"
                 type="button"
                 disabled={!examConsent || busy}
+
                 onClick={async () => {
                   if (!examConsent || !pendingExam || busy) return;
-                  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-                    setMessage("⚠ This browser cannot record camera and microphone.");
-                    return;
-                  }
+
                   setBusy(true);
                   setMessage("");
+                  releasePreviewStream();
+
                   try {
-                    releasePreviewStream();
-                    const stream = await navigator.mediaDevices.getUserMedia({
-                      video: { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 15 } },
-                      audio: { echoCancellation: true, noiseSuppression: true },
-                    });
                     if (
-                      !stream.getVideoTracks().some(track => track.readyState === "live") ||
-                      !stream.getAudioTracks().some(track => track.readyState === "live")
+                      !navigator.mediaDevices?.getUserMedia ||
+                      typeof MediaRecorder === "undefined"
                     ) {
-                      stream.getTracks().forEach(track => track.stop());
-                      throw new Error("Both camera and microphone must be working.");
+                      setProctoringMode("browser");
+                      setView("prepare");
+                      return;
                     }
-                    previewStreamRef.current = stream;
-                    setPreviewReady(true);
+
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                      video: {
+                        width: { ideal: 640 },
+                        height: { ideal: 360 },
+                        frameRate: { ideal: 15 },
+                      },
+                      audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                      },
+                    });
+
+                    const hasVideo = stream.getVideoTracks().some(
+                      track => track.readyState === "live"
+                    );
+
+                    const hasAudio = stream.getAudioTracks().some(
+                      track => track.readyState === "live"
+                    );
+
+                    if (!hasVideo || !hasAudio) {
+                      stream.getTracks().forEach(track => track.stop());
+                      setProctoringMode("browser");
+                    } else {
+                      previewStreamRef.current = stream;
+                      setPreviewReady(true);
+                      setProctoringMode("camera");
+                    }
+
                     setView("prepare");
                   } catch (error: any) {
-                    setMessage(`⚠ Camera/microphone permission required: ${error?.message || error}`);
+                    if (error?.name === "NotFoundError" ||
+                      error?.name === "DevicesNotFoundError") {
+                      setProctoringMode("browser");
+                      setView("prepare");
+                    } else {
+                      setMessage(
+                        `⚠ Camera/microphone check failed: ${error?.message || error}. ` +
+                        "Please contact the examiner."
+                      );
+                    }
                   } finally {
                     setBusy(false);
                   }
                 }}
+
               >
                 {busy
                   ? "Checking camera and microphone..."
-                  : "Agree & Preview Camera"}
+                  : "Agree & Check Exam Security"}
               </button>
 
               <button
@@ -4292,8 +4469,8 @@ export default function App() {
 
             <p className="student-consent-note">
               <small>
-                Without consent and camera/microphone access,
-                you cannot begin the examination.
+                Consent and fullscreen are required. Camera and microphone
+                access are not required for approved browser-only examinations.
               </small>
             </p>
           </section>
@@ -4302,47 +4479,76 @@ export default function App() {
 
         {view === "prepare" && pendingExam && (
           <section className="panel student-prepare">
-            <h2>Camera Check — Ready to Begin</h2>
+            <h2>
+              {proctoringMode === "camera"
+                ? "Camera Check — Ready to Begin"
+                : "Browser Security Check — Ready to Begin"}
+            </h2>
             <div className="student-stepper">
               <span>1 · Consent</span>
-              <span className="step-current">2 · Camera check</span>
+              <span className="step-current">2 · Security check</span>
               <span>3 · Examination</span>
             </div>
-            <p>Preview your face and check your camera position. <b>The exam timer has not started, and nothing is being recorded.</b></p>
-
-            <div className="student-preview-area">
-              <video
-                className="student-preview-video"
-                ref={previewVideoRef}
-                autoPlay
-                muted
-                playsInline
-              />
-
-              <div
-                className={
-                  previewReady
-                    ? "student-camera-status"
-                    : "student-camera-status is-unavailable"
-                }
-              >
-                {previewReady
-                  ? "✓ Camera and microphone connected — preview only"
-                  : "Camera or microphone unavailable"}
-              </div>
-            </div>
-
-            <p>When you click Start, ExamPilot will enter fullscreen, create your timed attempt, and begin webcam/microphone recording automatically.</p>
-
-            <p role="status" style={{ marginTop: 12 }}>
-              {phoneModelState === "loading"
-                ? "⏳ Preparing AI mobile-phone detector..."
-                : phoneModelState === "ready"
-                  ? "✅ AI mobile-phone detector ready"
-                  : phoneModelState === "error"
-                    ? "⚠ Mobile-phone detector unavailable."
-                    : ""}
+            <p>
+              {proctoringMode === "camera"
+                ? "Check your camera position before starting."
+                : "Your computer will use browser-only security monitoring."}
+              {" "}
+              <b>The exam timer has not started.</b>
             </p>
+
+
+            {proctoringMode === "camera" ? (
+              <div className="student-preview-area">
+                <video
+                  className="student-preview-video"
+                  ref={previewVideoRef}
+                  autoPlay
+                  muted
+                  playsInline
+                />
+
+                <div className="student-camera-status">
+                  ✓ Camera and microphone connected — preview only
+                </div>
+              </div>
+            ) : (
+              <div className="student-info-box">
+                <ShieldCheck size={22} />
+                <div>
+                  <strong>Browser-only proctoring enabled</strong>
+                  <p>
+                    No webcam or microphone is required for this exam mode.
+                    Fullscreen, tab switching and restricted browser actions
+                    will still be monitored.
+                  </p>
+                  <p>No audio or video will be recorded.</p>
+                </div>
+              </div>
+            )}
+
+
+
+            <p>
+              {proctoringMode === "camera"
+                ? "Starting the exam will enter fullscreen and begin camera recording."
+                : "Starting the exam will enter fullscreen and begin browser-security monitoring. No recording is required."}
+            </p>
+
+
+
+
+            {proctoringMode === "camera" && (
+              <p role="status" style={{ marginTop: 12 }}>
+                {phoneModelState === "loading"
+                  ? "⏳ Preparing AI mobile-phone detector..."
+                  : phoneModelState === "ready"
+                    ? "✅ AI mobile-phone detector ready"
+                    : phoneModelState === "error"
+                      ? "⚠ Mobile-phone detector unavailable."
+                      : ""}
+              </p>
+            )}
 
             <div className="student-actions">
               <button
@@ -4350,9 +4556,9 @@ export default function App() {
 
                 disabled={
                   !examConsent ||
-                  !previewReady ||
                   busy ||
-                  phoneModelState === "loading"
+                  (proctoringMode === "camera" &&
+                    (!previewReady || phoneModelState === "loading"))
                 }
 
                 onClick={() => void enterExamFullscreen()}
@@ -4429,15 +4635,28 @@ export default function App() {
             <div className="student-exam-workspace">
               <div className="student-exam-camera-column">
 
-                <ExamCamera
-                  ref={examCameraRef}
-                  sessionId={active.session_id}
-                  token={token}
-                  clientId={examClientRef.current}
-                  autoStart={true}
-                  initialStream={previewStreamRef.current}
-                  onRecordingChange={setRecordingActive}
-                />
+
+                {proctoringMode === "camera" ? (
+                  <ExamCamera
+                    ref={examCameraRef}
+                    sessionId={active.session_id}
+                    token={token}
+                    clientId={examClientRef.current}
+                    autoStart={true}
+                    initialStream={previewStreamRef.current}
+                    onRecordingChange={setRecordingActive}
+                  />
+                ) : (
+                  <div className="student-info-box">
+                    <ShieldCheck size={22} />
+                    <strong>Browser monitoring active</strong>
+                    <p>
+                      This exam is being monitored without a webcam
+                      or microphone.
+                    </p>
+                  </div>
+                )}
+
 
               </div>
 
@@ -4446,7 +4665,7 @@ export default function App() {
 
 
 
-                {!recordingActive ? (
+                {proctoringMode === "camera" && !recordingActive ? (
                   <div style={{ padding: 20 }}>
                     <h3>Starting secure recording...</h3>
                     <p>Please remain in fullscreen. Exam questions unlock as soon as recording starts.</p>
@@ -4455,7 +4674,10 @@ export default function App() {
                 ) : !examFullscreen ? (
                   <div style={{ padding: 20 }}>
                     <h3>Fullscreen exited</h3>
-                    <p>Return to fullscreen to continue. The security incident is logged, and recording continues.</p>
+                    <p>
+                      Fullscreen was exited. This incident has been recorded.
+                      Return to fullscreen to continue your examination.
+                    </p>
                     <button type="button" className="primary" onClick={() => {
                       void document.documentElement.requestFullscreen()
                         .then(() => setExamFullscreen(true))
@@ -4471,7 +4693,7 @@ export default function App() {
                       </span>
 
                       <strong>
-                        Security incidents: {securityViolations} / 4
+                        Security incidents: {securityViolations} / 3
                       </strong>
                     </div>
 
@@ -4616,120 +4838,44 @@ export default function App() {
         {/* EVALUATION RESULTS — PRESERVED */}
         {/* ================================================== */}
 
-        {view === "result" &&
-          result &&
-          (() => {
 
-            const payload =
-              result?.result ||
-              result?.evaluation_results ||
-              result;
+        {view === "result" && result && (
+          <section className="panel">
+            <div className="empty">
+              <CheckCircle2 size={40} />
 
-            const rows = Array.isArray(payload?.results)
-              ? payload.results
-              : Array.isArray(payload)
-                ? payload
-                : [];
+              <h2>
+                {result.exam_terminated
+                  ? "Examination Terminated"
+                  : "Examination Submitted"}
+              </h2>
 
-            const obtained = rows.reduce(
-              (s: number, r: any) =>
-                s + Number(r.marks_awarded || 0),
-              0
-            );
+              <p>
+                {result.exam_terminated
+                  ? "Your examination was terminated due to security violations."
+                  : "Your answers have been submitted successfully."}
+              </p>
 
-            const total = rows.reduce(
-              (s: number, r: any) =>
-                s + Number(r.total_marks || 0),
-              0
-            );
+              <p>
+                Your examination will be reviewed by your teacher.
+              </p>
 
-            const percentage =
-              total > 0
-                ? Math.round((obtained / total) * 100)
-                : 0;
+              <button
+                className="primary"
+                onClick={() => {
+                  setView("home");
+                  setActive(null);
+                  setResult(null);
+                  setAnswers({});
+                  load().catch(fail);
+                }}
+              >
+                Back to overview
+              </button>
+            </div>
+          </section>
+        )}
 
-            return (
-
-              <section className="panel">
-
-                <div className="empty">
-
-                  <Trophy size={34} />
-
-                  <h2>
-                    {result.exam_terminated
-                      ? "Examination Terminated"
-                      : "Thank you!"}
-                  </h2>
-
-                  <p>
-                    {result.exam_terminated
-                      ? "Your examination was automatically ended because the security violation limit was reached."
-                      : result.evaluation_pending
-                        ? "Your examination has been submitted. Evaluation is pending."
-                        : "Your examination has been submitted for evaluation."}
-                  </p>
-
-                  {total > 0 && (
-
-                    <div
-                      className="stats"
-                      style={{
-                        width: "100%",
-                        marginTop: 20,
-                      }}
-                    >
-
-                      <div>
-                        <Trophy />
-                        <small>Marks</small>
-                        <b>
-                          {obtained} / {total}
-                        </b>
-                      </div>
-
-                      <div>
-                        <CheckCircle2 />
-                        <small>Percentage</small>
-                        <b>{percentage}%</b>
-                      </div>
-
-                      <div>
-                        <ShieldCheck />
-                        <small>Status</small>
-                        <b>
-                          {result.exam_terminated
-                            ? "Terminated"
-                            : result.evaluation_pending
-                              ? "Pending"
-                              : "Completed"}
-                        </b>
-                      </div>
-
-                    </div>
-
-                  )}
-
-                  <button
-                    className="primary"
-                    onClick={() => {
-                      setView("home");
-                      setActive(null);
-                      setResult(null);
-                      setAnswers({});
-                      load().catch(fail);
-                    }}
-                  >
-                    Back to overview
-                  </button>
-
-                </div>
-
-              </section>
-
-            );
-
-          })()}
 
         {/* ================================================== */}
         {/* FOOTER */}

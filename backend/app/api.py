@@ -10,7 +10,7 @@ import sqlite3
 import time
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -195,7 +195,12 @@ class ExamClientRequest(BaseModel):
 
 class StartExamRequest(BaseModel):
     consent_accepted: bool
+    proctoring_mode: Literal["camera", "browser"] = "camera"
 
+
+class BrowserOnlyPermissionRequest(BaseModel):
+    allowed: bool
+    
 class ProctoringEventRequest(BaseModel):
     event_type: str
     details: dict[str, Any] = Field(default_factory=dict)
@@ -229,7 +234,7 @@ BROWSER_VIOLATION_EVENTS = {
 # PROCTORING WARNING POLICY
 # ============================================================
 
-PROCTORING_TERMINATION_THRESHOLD = 4
+PROCTORING_TERMINATION_THRESHOLD = 3
 PROCTORING_INCIDENT_WINDOW_SECONDS = 2.0
 
 
@@ -287,13 +292,9 @@ def calculate_proctoring_warning_status(events):
         level = "warning"
         warning = "Second warning: Further violations may terminate your exam."
 
-    elif count == 3:
-        level = "final_warning"
-        warning = "Final warning: The next incident reaches the termination threshold."
-
     else:
         level = "termination_threshold"
-        warning = "Security violation limit reached. Examination flagged for termination."
+        warning = "Third security incident: Examination automatically terminated."
 
     return {
         "incident_count": count,
@@ -440,6 +441,8 @@ def public_session(state: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "session_id": session.get("session_id"),
+        "proctoring_mode": state.get("_proctoring_mode"),
+        "browser_only_allowed": bool(state.get("_allow_browser_only", False)),
         "exam_id": session.get("exam_id"),
         "status": session.get("status"),
         "proctoring_terminated": bool(
@@ -553,6 +556,43 @@ def load_session(session_id: str) -> dict[str, Any]:
         detail="Exam session not found",
     )
 
+@app.put("/api/teacher/exams/{assignment_id}/browser-only")
+def set_browser_only_permission(
+    assignment_id: str,
+    request: BrowserOnlyPermissionRequest,
+    user: dict[str, Any] = Depends(require_role("teacher")),
+):
+    with sessions_lock:
+        state = load_session(assignment_id)
+
+        if not state.get("_is_assignment"):
+            raise HTTPException(409, "This is not an exam assignment")
+
+        if state.get("_owner_email") != user["email"]:
+            raise HTTPException(403, "You do not own this exam")
+
+        with SessionLocal() as db:
+            has_attempt = db.scalar(
+                select(ExamAttempt.id)
+                .where(ExamAttempt.exam_id == assignment_id)
+                .limit(1)
+            )
+
+        if has_attempt is not None:
+            raise HTTPException(
+                409,
+                "Proctoring mode cannot be changed after an attempt has started",
+            )
+
+        state["_allow_browser_only"] = request.allowed
+
+        _save_state(state)
+        sessions[assignment_id] = state
+
+        return {
+            "assignment_id": assignment_id,
+            "browser_only_allowed": request.allowed,
+        }
 
 @app.put("/api/teacher/exams/{assignment_id}/schedule")
 def set_exam_schedule(
@@ -716,18 +756,14 @@ def finalize_exam_locked(
 
     return {
         "message": (
-            "Exam automatically terminated"
+            "Examination terminated due to security violations."
             if proctoring_terminated
-            else "Exam submitted"
+            else "Examination submitted successfully."
         ),
         "exam_terminated": proctoring_terminated,
         "status": state["exam_session"]["status"],
         "evaluation_pending": state.get(
             "_evaluation_pending", False
-        ),
-        "result": state.get("final_result"),
-        "evaluation_results": state.get(
-            "evaluation_results", []
         ),
     }
 
@@ -1168,6 +1204,9 @@ def list_teacher_exams(
             exam.update({
                 "session_id": assignment_id,
                 "assignment_id": assignment_id,
+                "browser_only_allowed": bool(
+                    state.get("_allow_browser_only", False)
+                 ),
                 "division": state.get("_target_division"),
                 "subject": state.get("_subject"),
                 "topic": state.get("_topic"),
@@ -1420,7 +1459,7 @@ def start_student_exam(
     user: dict[str, Any] = Depends(require_role("student")),
 ):
     if request.consent_accepted is not True:
-        raise HTTPException(403, "Camera and microphone recording consent is required")
+        raise HTTPException(403, "Examination monitoring consent is required")
 
     with sessions_lock:
         state = load_session(assignment_id)
@@ -1437,9 +1476,29 @@ def start_student_exam(
         if not _same_division(state.get("_target_division"), user.get("division")):
             raise HTTPException(403, "This examination is assigned to another division")
 
+        if (
+            request.proctoring_mode == "browser"
+            and not state.get("_allow_browser_only", False)
+        ):
+            raise HTTPException(
+               403,
+               "Browser-only proctoring has not been authorized for this exam",
+            )
         # Reuse an existing valid attempt. A real exam cannot be restarted
         # or have its deadline reset by clicking Start again.
         attempt = _create_student_attempt(state, user)
+        existing_mode = attempt.get("_proctoring_mode")
+
+        if existing_mode is not None and existing_mode != request.proctoring_mode:
+            raise HTTPException(
+            409,
+            "This attempt has already been started in another proctoring mode",
+        )
+ 
+        if existing_mode is None:
+            attempt["_proctoring_mode"] = request.proctoring_mode
+            _save_state(attempt)
+            sessions[str(attempt["exam_session"]["session_id"])] = attempt
         status = str((attempt.get("exam_session") or {}).get("status"))
         if status != "in_progress":
             raise HTTPException(
@@ -1554,6 +1613,7 @@ def exam_heartbeat(
 def record_proctoring_event(
     session_id: str,
     request: ProctoringEventRequest,
+    client_id: str | None = Header(default=None, alias="X-Exam-Client"),
     user: dict[str, Any] = Depends(require_role("student")),
 ):
     if request.event_type not in ALLOWED_PROCTORING_EVENTS:
@@ -1567,6 +1627,9 @@ def record_proctoring_event(
         )
 
     with sessions_lock:
+        state = load_session(session_id)
+        verify_active_student_attempt(state, user)
+        verify_exam_client(state, client_id)
 
         # First save the security event and determine
         # the official incident count.
@@ -1787,13 +1850,13 @@ def get_results(
                 detail="This is an examination assignment, not a student attempt",
             )
 
-        if user["role"] == "student":
-            if not _can_access_attempt(state, user):
-                raise HTTPException(
-                    status_code=403,
-                    detail="You cannot access these results",
-                )
-        elif state.get("_owner_email") != user["email"]:
+        if user["role"] != "teacher":
+            raise HTTPException(
+                status_code=403,
+                detail="Examination results are available only to teachers",
+            )
+
+        if state.get("_owner_email") != user["email"]:
             raise HTTPException(
                 status_code=403,
                 detail="You cannot access these results",
@@ -1929,6 +1992,7 @@ def teacher_results(
 
             rows.append({
                 "session_id": attempt.id,
+                "proctoring_mode": state.get("_proctoring_mode", "camera"),
                 "started_at": (
                     session_data.get("started_at")
                     or (
@@ -1938,7 +2002,7 @@ def teacher_results(
                     )
                 ),
                 "warning_count": min(
-    proctoring_status["incident_count"], 3
+    proctoring_status["incident_count"], 2
 ),
 "incident_count": proctoring_status["incident_count"],
 "security_event_count": proctoring_status["total_events"],
