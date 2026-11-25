@@ -370,6 +370,17 @@ export default function App() {
     string[]
   >([]);
 
+  // Existing question paper upload
+const [questionPaperFile, setQuestionPaperFile] = useState<File | null>(null);
+const [uploadingQuestionPaper, setUploadingQuestionPaper] = useState(false);
+const [importedQuestions, setImportedQuestions] = useState<any[]>([]);
+const [importedPaperContext, setImportedPaperContext] = useState("");
+const [examCreationMode, setExamCreationMode] = useState<
+  "ai" | "import"
+>("ai");
+const [questionPaperFilename, setQuestionPaperFilename] = useState("");
+const [questionPaperTotalMarks, setQuestionPaperTotalMarks] = useState(0);
+
 
   // ==========================================================
   // PROCTORING MONITORING - SHARED EVENT HANDLER
@@ -1582,6 +1593,97 @@ export default function App() {
   }
 
   // ==========================================================
+  // EXISTING QUESTION PAPER UPLOAD
+  // ==========================================================
+
+  async function uploadQuestionPaper(e: FormEvent) {
+    e.preventDefault();
+
+    if (!questionPaperFile) {
+      setMessage("⚠ Please select a question paper.");
+      return;
+    }
+
+    const allowedExtensions = [".pdf", ".doc", ".docx"];
+
+    const extension = questionPaperFile.name
+      .substring(questionPaperFile.name.lastIndexOf("."))
+      .toLowerCase();
+
+    if (!allowedExtensions.includes(extension)) {
+      setMessage("⚠ Only PDF, DOC and DOCX files are supported.");
+      return;
+    }
+
+    if (questionPaperFile.size > 25 * 1024 * 1024) {
+      setMessage("⚠ File size must not exceed 25 MB.");
+      return;
+    }
+
+    setUploadingQuestionPaper(true);
+    setMessage("");
+
+    try {
+      const formData = new FormData();
+
+      formData.append("file", questionPaperFile);
+
+      const data = await req(
+        "/api/teacher/question-paper/preview",
+        token,
+        {
+          method: "POST",
+          body: formData,
+        }
+      );
+
+      const questions = (data.questions || []).map(
+        (question: any, index: number) => ({
+          ...question,
+          question_id:
+            question.question_id || `imported_q${index + 1}`,
+          marks: Number(question.marks ?? 0),
+        })
+      );
+
+      setImportedQuestions(questions);
+      setImportedPaperContext(data.paper_context || "");
+
+      setQuestionPaperFilename(
+        data.filename || questionPaperFile.name
+      );
+
+      setQuestionPaperTotalMarks(
+        questions.reduce(
+          (total: number, question: any) =>
+            total + Number(question.marks ?? 0),
+          0
+        )
+      );
+
+      setMessage(
+        `✓ Successfully extracted ${data.question_count} questions. Review them before creating the examination.`
+      );
+
+      setQuestionPaperFile(null);
+
+      const fileInput = document.getElementById(
+        "question-paper-file"
+      ) as HTMLInputElement | null;
+
+      if (fileInput) {
+        fileInput.value = "";
+      }
+
+    } catch (e: any) {
+      fail(e);
+
+    } finally {
+      setUploadingQuestionPaper(false);
+    }
+  }
+
+  // ==========================================================
   // DELETE PROFESSOR NOTES
   // ==========================================================
 
@@ -1793,6 +1895,113 @@ export default function App() {
 
     } finally {
 
+      setBusy(false);
+    }
+  }
+
+    // ==========================================================
+  // CREATE EXAM FROM IMPORTED QUESTION PAPER
+  // ==========================================================
+
+  async function createImportedExam() {
+
+    if (importedQuestions.length === 0) {
+      setMessage("⚠ Please upload and review a question paper first.");
+      return;
+    }
+
+    // Validate every imported question.
+    const invalidQuestion = importedQuestions.some(
+      (q: any) =>
+        !q.question?.trim() ||
+        !Number.isFinite(Number(q.marks)) ||
+        Number(q.marks) <= 0
+    );
+
+    if (invalidQuestion) {
+      setMessage(
+        "⚠ Every question must have text and a valid positive mark."
+      );
+      return;
+    }
+
+    const questionIds = importedQuestions.map(
+      (q: any) => q.question_id
+    );
+
+    if (new Set(questionIds).size !== questionIds.length) {
+      setMessage("⚠ Duplicate question IDs found.");
+      return;
+    }
+
+    setBusy(true);
+    setMessage("");
+
+    try {
+      const payload = {
+        division: f.division.trim(),
+        subject: f.subject,
+        topic: f.topic,
+        paper_context: importedPaperContext,
+
+        duration_minutes: Number(durationMinutes),
+
+        scheduled_start_at:
+          scheduledDate && startTime
+            ? new Date(
+                `${scheduledDate}T${startTime}`
+              ).toISOString()
+            : null,
+
+        scheduled_end_at:
+          scheduledDate && endTime
+            ? new Date(
+                `${scheduledDate}T${endTime}`
+              ).toISOString()
+            : null,
+
+        questions: importedQuestions.map((q: any) => ({
+          question_id: q.question_id,
+          question: q.question.trim(),
+          question_type: q.question_type || "subjective",
+          options: q.options || {},
+          marks: Number(q.marks),
+        })),
+      };
+
+      const result = await req(
+        "/api/teacher/imported-exams",
+        token,
+        {
+          method: "POST",
+          body: JSON.stringify(payload),
+        }
+      );
+
+      setMessage(
+        `✓ Imported examination created successfully for Division ${f.division}. Total marks: ${result.total_marks}.`
+      );
+
+      setImportedQuestions([]);
+      setQuestionPaperFilename("");
+      setQuestionPaperTotalMarks(0);
+
+      setView("home");
+
+      const refreshed = await req(
+        "/api/teacher/exams",
+        token
+      );
+
+      setExams(
+        Array.isArray(refreshed.exams)
+          ? refreshed.exams
+          : []
+      );
+
+    } catch (e: any) {
+      fail(e);
+    } finally {
       setBusy(false);
     }
   }
@@ -3677,8 +3886,86 @@ export default function App() {
           <>
 
             {/* ---------------------------------------------- */}
-            {/* PROFESSOR NOTES MANAGEMENT */}
+            {/* EXAMINATION CREATION MODE */}
             {/* ---------------------------------------------- */}
+
+            <section className="panel">
+
+              <div className="section-head">
+
+                <div>
+                  <h2>Create Examination</h2>
+
+                  <p>
+                    Choose how you want to prepare your examination.
+                  </p>
+                </div>
+
+              </div>
+
+              <div className="grid two">
+
+                <button
+                  type="button"
+                  className={
+                    examCreationMode === "ai"
+                      ? "exam-card selected"
+                      : "exam-card"
+                  }
+                  onClick={() => setExamCreationMode("ai")}
+                  style={{
+                    textAlign: "left",
+                    padding: 24,
+                    cursor: "pointer",
+                  }}
+                >
+
+                  <Sparkles size={24} />
+
+                  <h3>Option 1 · Generate with AI</h3>
+
+                  <p>
+                    Upload professor notes and generate
+                    examination questions automatically.
+                  </p>
+
+                </button>
+
+                <button
+                  type="button"
+                  className={
+                    examCreationMode === "import"
+                      ? "exam-card selected"
+                      : "exam-card"
+                  }
+                  onClick={() => setExamCreationMode("import")}
+                  style={{
+                    textAlign: "left",
+                    padding: 24,
+                    cursor: "pointer",
+                  }}
+                >
+
+                  <Upload size={24} />
+
+                  <h3>Option 2 · Existing Question Paper</h3>
+
+                  <p>
+                    Upload PDF, DOC or DOCX and use the
+                    original questions directly.
+                  </p>
+
+                </button>
+
+              </div>
+
+            </section>
+
+
+           {/* ---------------------------------------------- */}
+           {/* PROFESSOR NOTES MANAGEMENT */}
+           {/* ---------------------------------------------- */}
+           {examCreationMode === "ai" && (
 
             <section className="panel teacher-notes-panel">
 
@@ -3895,36 +4182,291 @@ export default function App() {
 
             </section>
 
+            )}
+
             {/* ---------------------------------------------- */}
-            {/* EXAM CONFIGURATION */}
+            {/* OPTION 2 — UPLOAD EXISTING QUESTION PAPER */}
             {/* ---------------------------------------------- */}
+
+            {examCreationMode === "import" && (
+
+              <section className="panel teacher-question-paper-panel">
+
+                <div className="section-head">
+                  <div>
+                    <h2>Upload Existing Question Paper</h2>
+                    <p>
+                      Upload a prepared question paper and use its original
+                      questions directly in the examination.
+                    </p>
+
+                </div>
+
+                <span className="pill">Option 2</span>
+              </div>
+
+              <form
+                onSubmit={uploadQuestionPaper}
+                className="exam-form"
+              >
+
+                <h3>
+                  <Upload size={18} />
+                  Select Question Paper
+                </h3>
+
+                <label>
+                  Upload document
+
+                  <input
+                    id="question-paper-file"
+                    type="file"
+                    accept=".pdf,.doc,.docx"
+                    required
+                    onChange={(e) =>
+                      setQuestionPaperFile(
+                        e.target.files?.[0] || null
+                      )
+                    }
+                  />
+
+                  <small>
+                    Supported formats: PDF, DOC, DOCX · Maximum 25 MB
+                  </small>
+                </label>
+
+                {questionPaperFile && (
+                  <div className="message">
+                    Selected: {questionPaperFile.name}
+                  </div>
+                )}
+
+                <div className="form-end">
+                  <span>
+                    <b>Direct question import</b>
+                    <small>
+                      Questions are extracted without AI rewriting or
+                      regeneration.
+                    </small>
+                  </span>
+
+                  <button
+                    type="submit"
+                    className="primary"
+                    disabled={
+                      uploadingQuestionPaper || !questionPaperFile
+                    }
+                  >
+                    {uploadingQuestionPaper
+                      ? "Extracting..."
+                      : "Upload & Extract Questions"}
+
+                    <Upload size={16} />
+                  </button>
+                </div>
+
+              </form>
+
+              {/* EXTRACTED QUESTION REVIEW */}
+
+              {importedQuestions.length > 0 && (
+
+                <div className="exam-form">
+
+                  <div className="section-head">
+                    <div>
+                      <h3>Review Extracted Questions</h3>
+                      <p>{questionPaperFilename}</p>
+                    </div>
+
+                    <span className="pill">
+                      {importedQuestions.length} Questions
+                    </span>
+                  </div>
+
+                  {importedQuestions.map((question, index) => (
+
+                    <div
+                      className="exam-card"
+                      key={question.question_id}
+                      style={{ marginBottom: 16 }}
+                    >
+
+                      <div className="section-head">
+
+                        <h3>Question {index + 1}</h3>
+
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() => {
+                            const updated = importedQuestions.filter(
+                              (_, i) => i !== index
+                            );
+
+                            setImportedQuestions(updated);
+
+                            setQuestionPaperTotalMarks(
+                              updated.reduce(
+                                (total, q) =>
+                                  total + Number(q.marks || 0),
+                                0
+                              )
+                            );
+                          }}
+                        >
+                          <Trash2 size={15} />
+                          Remove
+                        </button>
+
+                      </div>
+
+                      <label>
+                        Question text
+
+                        <textarea
+                          rows={4}
+                          value={question.question}
+                          onChange={(e) => {
+                            const updated = [...importedQuestions];
+
+                            updated[index] = {
+                              ...updated[index],
+                              question: e.target.value,
+                            };
+
+                            setImportedQuestions(updated);
+                          }}
+                        />
+                      </label>
+
+                      <label>
+                        Marks
+
+                        <input
+                          type="number"
+                          min="0.5"
+                          step="0.5"
+                          value={question.marks}
+                          onChange={(e) => {
+                            const updated = [...importedQuestions];
+
+                            updated[index] = {
+                              ...updated[index],
+                              marks: Number(e.target.value),
+                            };
+
+                            setImportedQuestions(updated);
+
+                            setQuestionPaperTotalMarks(
+                              updated.reduce(
+                                (total, q) =>
+                                  total + Number(q.marks || 0),
+                                0
+                              )
+                            );
+                          }}
+                        />
+                      </label>
+
+                    </div>
+
+                  ))}
+
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => {
+                      const newQuestion = {
+                        question_id: `imported_q${Date.now()}`,
+                        question_number: importedQuestions.length + 1,
+                        question: "",
+                        question_type: "subjective",
+                        options: {},
+                        marks: 1,
+                      };
+
+                      const updated = [
+                        ...importedQuestions,
+                        newQuestion,
+                      ];
+
+                      setImportedQuestions(updated);
+
+                      setQuestionPaperTotalMarks(
+                        updated.reduce(
+                          (total, q) => total + Number(q.marks || 0),
+                          0
+                        )
+                      );
+                    }}
+                  >
+                    + Add Question
+                  </button>
+
+                  <div className="teacher-exam-review">
+                    <h3>Question Paper Summary</h3>
+
+                    <div className="teacher-review-grid">
+
+                      <div>
+                        <small>Total questions</small>
+                        <strong>{importedQuestions.length}</strong>
+                      </div>
+
+                      <div>
+                        <small>Total marks</small>
+                        <strong>{questionPaperTotalMarks}</strong>
+                      </div>
+
+                    </div>
+                  </div>
+
+                </div>
+
+              )}
+
+            </section>
+       )}
 
             <section className="panel teacher-configuration-panel">
-
-              <h2>Exam configuration</h2>
+              <h2>
+                {examCreationMode === "ai"
+                  ? "AI Exam Configuration"
+                  : "Imported Exam Configuration"}
+              </h2>
 
               <p>
-                Configure your examination using the uploaded
-                professor notes.
+                {examCreationMode === "ai"
+                  ? "Configure an examination using your professor notes and AI-generated questions."
+                  : "Configure an examination using questions extracted from your uploaded question paper."}
               </p>
 
-              <div className="teacher-form-guide">
+                            <div className="teacher-form-guide">
                 <div>
                   <span className="teacher-guide-number">01</span>
                   <strong>Exam details</strong>
-                  <small>Division, subject and difficulty</small>
+                  <small>Division, subject and topic</small>
                 </div>
 
                 <div>
                   <span className="teacher-guide-number">02</span>
-                  <strong>Question setup</strong>
-                  <small>Notes and question mix</small>
+                  <strong>
+                    {examCreationMode === "ai"
+                      ? "AI question setup"
+                      : "Question review"}
+                  </strong>
+                  <small>
+                    {examCreationMode === "ai"
+                      ? "Notes and question distribution"
+                      : "Review questions and assign marks"}
+                  </small>
                 </div>
 
                 <div>
                   <span className="teacher-guide-number">03</span>
-                  <strong>Schedule & generate</strong>
-                  <small>Review before creating</small>
+                  <strong>Schedule & create</strong>
+                  <small>Review before publishing</small>
                 </div>
               </div>
 
@@ -3995,26 +4537,29 @@ export default function App() {
                     />
                   </label>
 
-                  <label>
-                    Difficulty
+                                    {examCreationMode === "ai" && (
+                    <label>
+                      Difficulty
 
-                    <select
-                      value={f.difficulty}
-                      onChange={(e) =>
-                        setF({
-                          ...f,
-                          difficulty: e.target.value,
-                        })
-                      }
-                    >
-                      <option value="L1">L1 - Easy</option>
-                      <option value="L2">L2 - Medium</option>
-                      <option value="L3">L3 - Hard</option>
-                    </select>
-                  </label>
+                      <select
+                        value={f.difficulty}
+                        onChange={(e) =>
+                          setF({
+                            ...f,
+                            difficulty: e.target.value,
+                          })
+                        }
+                      >
+                        <option value="L1">L1 - Easy</option>
+                        <option value="L2">L2 - Medium</option>
+                        <option value="L3">L3 - Hard</option>
+                      </select>
+                    </label>
+                  )}
 
                 </div>
-
+             {examCreationMode === "ai" && (
+                  <>
                 <h3>03 · Select professor notes</h3>
 
                 <p>
@@ -4107,8 +4652,13 @@ export default function App() {
 
                   </div>
 
+                              )}
+                  </>
                 )}
 
+
+              {examCreationMode === "ai" && (
+                  <>
                 <h3>04 · Question mix</h3>
 
                 <div className="mix">
@@ -4134,6 +4684,8 @@ export default function App() {
                     </label>
                   ))}
                 </div>
+                                  </>
+                )}
 
                 <h3>05 · Exam schedule</h3>
 
@@ -4215,7 +4767,9 @@ export default function App() {
                     <div>
                       <h3>Review your examination</h3>
                       <p>
-                        Confirm these settings before generating questions.
+                        {examCreationMode === "ai"
+                          ? "Confirm these settings before generating questions."
+                          : "Confirm these details before creating your examination."}
                       </p>
                     </div>
                     <CheckCircle2 size={22} />
@@ -4224,36 +4778,56 @@ export default function App() {
                   <div className="teacher-review-grid">
                     <div>
                       <small>Target division</small>
-                      <strong>Division {f.division || "Not selected"}</strong>
+                      <strong>
+                        Division {f.division || "Not selected"}
+                      </strong>
                     </div>
 
                     <div>
                       <small>Subject & topic</small>
-                      <strong>{f.subject} · {f.topic || "No topic"}</strong>
-                    </div>
-
-                    <div>
-                      <small>Difficulty</small>
                       <strong>
-                        {f.difficulty === "L1"
-                          ? "Easy"
-                          : f.difficulty === "L2"
-                            ? "Medium"
-                            : "Hard"}
+                        {f.subject} · {f.topic || "No topic"}
                       </strong>
                     </div>
 
-                    <div>
-                      <small>Question distribution</small>
-                      <strong>
-                        {f.normal} MCQ · {f.scenario} Scenario · {f.coding} Coding
-                      </strong>
-                    </div>
+                    {examCreationMode === "ai" ? (
+                      <>
+                        <div>
+                          <small>Difficulty</small>
+                          <strong>
+                            {f.difficulty === "L1"
+                              ? "Easy"
+                              : f.difficulty === "L2"
+                                ? "Medium"
+                                : "Hard"}
+                          </strong>
+                        </div>
 
-                    <div>
-                      <small>Selected documents</small>
-                      <strong>{selectedDocuments.length} selected</strong>
-                    </div>
+                        <div>
+                          <small>Question distribution</small>
+                          <strong>
+                            {f.normal} MCQ · {f.scenario} Scenario · {f.coding} Coding
+                          </strong>
+                        </div>
+
+                        <div>
+                          <small>Selected documents</small>
+                          <strong>{selectedDocuments.length} selected</strong>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div>
+                          <small>Total questions</small>
+                          <strong>{importedQuestions.length}</strong>
+                        </div>
+
+                        <div>
+                          <small>Total marks</small>
+                          <strong>{questionPaperTotalMarks}</strong>
+                        </div>
+                      </>
+                    )}
 
                     <div>
                       <small>Exam duration</small>
@@ -4274,49 +4848,68 @@ export default function App() {
                 </div>
 
                 <div className="form-end">
+                  {examCreationMode === "ai" ? (
+                    <>
+                      <span>
+                        <b>
+                          {f.normal + f.scenario + f.coding} of {f.count} questions configured
+                        </b>
 
-                  <span>
+                        <div
+                          className={
+                            f.normal + f.scenario + f.coding === f.count
+                              ? "teacher-form-validation valid"
+                              : "teacher-form-validation invalid"
+                          }
+                        >
+                          {f.normal + f.scenario + f.coding === f.count
+                            ? "✓ Question distribution is valid"
+                            : "⚠ The question types must add up to the total"}
+                        </div>
 
-                    <b>
-                      {f.normal + f.scenario + f.coding} of {f.count} questions configured
-                    </b>
+                        <small>
+                          Selected documents: {selectedDocuments.length}
+                          <br />
+                          Question mix must equal total.
+                        </small>
+                      </span>
 
-                    <div
-                      className={
-                        f.normal + f.scenario + f.coding === f.count
-                          ? "teacher-form-validation valid"
-                          : "teacher-form-validation invalid"
-                      }
-                    >
-                      {f.normal + f.scenario + f.coding === f.count
-                        ? "✓ Question distribution is valid"
-                        : "⚠ The question types must add up to the total"}
-                    </div>
+                      <button
+                        className="primary"
+                        disabled={
+                          busy ||
+                          selectedDocuments.length === 0 ||
+                          f.normal + f.scenario + f.coding !== f.count
+                        }
+                      >
+                        {busy ? "Generating..." : "Generate exam"}
+                        <Sparkles size={16} />
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <span>
+                        <b>
+                          {importedQuestions.length} questions · {questionPaperTotalMarks} marks
+                        </b>
 
-                    <small>
-                      Selected documents: {selectedDocuments.length}
-                      <br />
-                      Question mix must equal total.
-                    </small>
+                        <small>
+                          Questions extracted from the uploaded paper.
+                          Review them before creating the examination.
+                        </small>
+                      </span>
 
-                  </span>
-
-                  <button
-                    className="primary"
-                    disabled={
-                      busy ||
-                      selectedDocuments.length === 0 ||
-                      f.normal + f.scenario + f.coding !== f.count
-                    }
-                  >
-                    {busy
-                      ? "Generating..."
-                      : "Generate exam"}
-
-                    <Sparkles size={16} />
-
-                  </button>
-
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={busy || importedQuestions.length === 0}
+                        onClick={() => void createImportedExam()}
+                      >
+                        {busy ? "Creating..." : "Create Examination"}
+                        <CheckCircle2 size={16} />
+                      </button>
+                    </>
+                  )}
                 </div>
 
               </form>
@@ -4704,8 +5297,312 @@ export default function App() {
                       </div>
                     )}
 
+                                      {/* Shared context from imported question paper */}
+                    {(
+                      (active as any).paper_context ||
+                      (active.questions?.[0] as any)?.paper_context
+                    ) && (
+                      <section
+                        className="panel"
+                        style={{
+                          marginBottom: 24,
+                          padding: 24,
+                          border: "1px solid #dce3f0",
+                        }}
+                      >
+                                                {(() => {
+                          const context = String(
+                            (active as any).paper_context ||
+                            (active.questions?.[0] as any)?.paper_context ||
+                            ""
+                          );
+
+                          const lines = context
+                            .split("\n")
+                            .map((line) => line.trim())
+                            .filter(Boolean);
+
+                                                      const referenceBlocks: Array<
+                              | { type: "text"; content: string }
+                              | {
+                                  type: "table";
+                                  number: string;
+                                  rows: string[][];
+                                }
+                            > = [];
+
+                            let currentTable: string | null = null;
+                            let currentRows: string[][] = [];
+
+                            const finishTable = () => {
+                              if (
+                                currentTable !== null &&
+                                currentRows.length > 0
+                              ) {
+                                referenceBlocks.push({
+                                  type: "table",
+                                  number: currentTable,
+                                  rows: [...currentRows],
+                                });
+                              }
+
+                              currentTable = null;
+                              currentRows = [];
+                            };
+
+                            lines.forEach((line) => {
+                              const startMatch = line.match(
+                                /^\[\[TABLE_START:(\d+)\]\]$/
+                              );
+
+                              if (startMatch) {
+                                finishTable();
+                                currentTable = startMatch[1];
+                                return;
+                              }
+
+                              if (line === "[[TABLE_END]]") {
+                                finishTable();
+                                return;
+                              }
+
+                              if (currentTable !== null) {
+                                const cells = line
+                                  .split("|")
+                                  .map((cell) => cell.trim());
+
+                                currentRows.push(cells);
+                              } else if (
+                                !line.startsWith("[Page") &&
+                                !/^Page \d+$/i.test(line) &&
+                                !/^End of Question Paper/i.test(line)
+                              ) {
+                                referenceBlocks.push({
+                                  type: "text",
+                                  content: line,
+                                });
+                              }
+                            });
+
+                            finishTable();
+
+
+
+                          const paperTitle =
+                            lines.find(
+                              (line) =>
+                                line.trim() &&
+                                !line.startsWith("[Page") &&
+                                !/^Page \d+$/i.test(line)
+                            ) || "Examination Question Paper";
+
+                          const details = lines.filter((line) =>
+                            /Time:|Duration:|Total Marks:|Questions:/i.test(line)
+                          );
+
+                          return (
+                            <div
+                              style={{
+                                marginTop: 24,
+                                marginBottom: 32,
+                                border: "1px solid #dbe3ef",
+                                borderRadius: 14,
+                                overflow: "hidden",
+                                background: "#ffffff",
+                              }}
+                            >
+                              {/* QUESTION PAPER HEADER */}
+                              <div
+                                style={{
+                                  padding: "28px 32px",
+                                  background:
+                                    "linear-gradient(135deg, #172554, #1e40af)",
+                                  color: "#ffffff",
+                                }}
+                              >
+                                <span
+                                  style={{
+                                    fontSize: 11,
+                                    fontWeight: 700,
+                                    letterSpacing: 2,
+                                    opacity: 0.8,
+                                  }}
+                                >
+                                  EXAMINATION PAPER
+                                </span>
+
+                                <h2
+                                  style={{
+                                    margin: "12px 0 0",
+                                    fontSize: 25,
+                                    color: "#ffffff",
+                                  }}
+                                >
+                                  {paperTitle}
+                                </h2>
+                              </div>
+
+                              {/* EXAM DETAILS */}
+                              {details.length > 0 && (
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    flexWrap: "wrap",
+                                    gap: 12,
+                                    padding: 20,
+                                    background: "#eff4ff",
+                                    borderBottom: "1px solid #dbe3ef",
+                                  }}
+                                >
+                                  {details.map((detail, index) => (
+                                    <div
+                                      key={index}
+                                      style={{
+                                        padding: "10px 16px",
+                                        background: "#ffffff",
+                                        border: "1px solid #dbe3ef",
+                                        borderRadius: 8,
+                                        fontSize: 13,
+                                        fontWeight: 600,
+                                        color: "#1e3a8a",
+                                      }}
+                                    >
+                                      {detail}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+
+                              {/* QUESTION PAPER CONTENT */}
+                              <div style={{ padding: 24 }}>
+                                <h3
+                                  style={{
+                                    margin: "0 0 16px",
+                                    fontSize: 19,
+                                    fontWeight: 700,
+                                    color: "#172554",
+                                  }}
+                                >
+                                  Instructions & Reference Material
+                                </h3>
+
+                                <div
+                                  style={{
+                                    padding: 24,
+                                    background: "#f8fafc",
+                                    border: "1px solid #e2e8f0",
+                                    borderRadius: 12,
+                                  }}
+                                >
+                                  {referenceBlocks.map((block, index) => {
+                                    if (block.type === "table") {
+                                      const headers = block.rows[0] || [];
+                                      const dataRows = block.rows.slice(1);
+
+                                      return (
+                                        <div
+                                          key={`table-${block.number}-${index}`}
+                                          style={{
+                                            marginTop: 20,
+                                            marginBottom: 28,
+                                            width: "100%",
+                                          }}
+                                        >
+                                          <h4
+                                            style={{
+                                              marginBottom: 12,
+                                              fontSize: 16,
+                                              fontWeight: 700,
+                                              color: "#172554",
+                                            }}
+                                          >
+                                            Reference Table {block.number}
+                                          </h4>
+
+                                          <div
+                                            style={{
+                                              width: "100%",
+                                              overflowX: "auto",
+                                              border: "1px solid #dbe3ef",
+                                              borderRadius: 10,
+                                              background: "#ffffff",
+                                            }}
+                                          >
+                                            <table
+                                              style={{
+                                                width: "100%",
+                                                borderCollapse: "collapse",
+                                                fontSize: 14,
+                                              }}
+                                            >
+                                              <thead>
+                                                <tr>
+                                                  {headers.map((header, i) => (
+                                                    <th
+                                                      key={i}
+                                                      style={{
+                                                        padding: "14px 16px",
+                                                        textAlign: "left",
+                                                        background: "#e8efff",
+                                                        color: "#172554",
+                                                        borderBottom: "2px solid #cbd5e1",
+                                                      }}
+                                                    >
+                                                      {header}
+                                                    </th>
+                                                  ))}
+                                                </tr>
+                                              </thead>
+
+                                              <tbody>
+                                                {dataRows.map((row, rowIndex) => (
+                                                  <tr key={rowIndex}>
+                                                    {headers.map((_, columnIndex) => (
+                                                      <td
+                                                        key={columnIndex}
+                                                        style={{
+                                                          padding: "12px 16px",
+                                                          borderBottom: "1px solid #e2e8f0",
+                                                          color: "#334155",
+                                                        }}
+                                                      >
+                                                        {row[columnIndex] || "—"}
+                                                      </td>
+                                                    ))}
+                                                  </tr>
+                                                ))}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                        </div>
+                                      );
+                                    }
+
+                                    return (
+                                      <p
+                                        key={`text-${index}`}
+                                        style={{
+                                          margin: "0 0 12px",
+                                          fontSize: 14,
+                                          lineHeight: 1.8,
+                                          color: "#334155",
+                                        }}
+                                      >
+                                        {block.content}
+                                      </p>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })()}
+                      </section>
+                    )}
+
                     <div className="student-questions-header">
                       <div>
+
                         <h2>Assessment questions</h2>
                         <p>Choose your answers carefully before submitting.</p>
                       </div>

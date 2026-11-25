@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import re
 import base64
 import hashlib
 import hmac
@@ -8,6 +8,7 @@ import os
 import secrets
 import sqlite3
 import time
+import tempfile
 from pathlib import Path
 from threading import Lock
 from typing import Any, Literal
@@ -63,7 +64,11 @@ from backend.app.demo_exam import (
     grade_demo_attempt,
 )
 
-
+from backend.app.document_processing.question_parser import (
+    parse_questions,
+    extract_question_paper_context,
+)
+from backend.app.schemas.imported_exam import ImportedExamRequest
 
 app = FastAPI(
     title="Online Course Examination System",
@@ -416,7 +421,7 @@ def require_role(*allowed_roles: str):
                 detail="Your account does not have permission for this action",
             )
         return user
-    
+
 
     return dependency
 
@@ -453,6 +458,7 @@ def public_session(state: dict[str, Any]) -> dict[str, Any]:
         "total_questions": session.get("total_questions", len(questions)),
         "answered_questions": session.get("answered_questions", 0),
         "questions": questions,
+        "paper_context": state.get("paper_context"),
     }
 
 
@@ -723,7 +729,7 @@ def finalize_exam_locked(
     sessions[session_id] = state
 
     try:
-        
+
         evaluation = (
             grade_demo_attempt(state)
             if state.get("_demo_exam")
@@ -1013,6 +1019,173 @@ def create_demo_exam(
     }
 
 
+@app.post("/api/teacher/imported-exams")
+def create_imported_exam(
+    request: ImportedExamRequest,
+    user: dict[str, Any] = Depends(require_role("teacher")),
+):
+    """Create an examination using questions imported from an existing paper."""
+
+    try:
+        target_division = request.division.strip()
+
+        if not target_division:
+            raise HTTPException(422, "Target division is required")
+
+        questions = [
+            question.model_dump()
+            for question in request.questions
+        ]
+
+        # Ensure question IDs are unique.
+        question_ids = [q["question_id"] for q in questions]
+
+        if len(question_ids) != len(set(question_ids)):
+            raise HTTPException(422, "Question IDs must be unique")
+
+        # Add examination metadata without changing question text.
+        for question in questions:
+            question["subject"] = request.subject
+            question["topic"] = request.topic
+            question["difficulty"] = "Imported"
+
+        total_marks = sum(q["marks"] for q in questions)
+
+        assignment_id = str(uuid4())
+
+        scheduled_start = _utc(request.scheduled_start_at)
+        scheduled_end = _utc(request.scheduled_end_at)
+
+        if (
+            scheduled_start
+            and scheduled_end
+            and scheduled_end <= scheduled_start
+        ):
+            raise HTTPException(
+                422,
+                "Scheduled end must be after scheduled start."
+            )
+
+        # Student-safe questions with shared paper context.
+        student_questions = [
+            {
+                "question_id": q["question_id"],
+                "subject": q["subject"],
+                "topic": q["topic"],
+                "difficulty": q["difficulty"],
+                "question_type": q["question_type"],
+                "question": q["question"],
+                "options": q["options"],
+                "paper_context": request.paper_context if index == 0 else None,
+            }
+            for index, q in enumerate(questions)
+        ]
+
+        # Construct assignment state directly.
+        # No AI generation or rewriting is performed.
+        result = {
+            "run_id": f"imported-{assignment_id}",
+            "exam_id": assignment_id,
+            "goal": "Examination created from an existing question paper",
+
+            # Preserve original instructions and database tables
+            "paper_context": request.paper_context,
+
+            "requirements": {
+                "teacher_id": user["id"],
+                "subject": request.subject,
+                "topic": request.topic,
+                "notes_only": False,
+                "imported_question_paper": True,
+            },
+            "questions": questions,
+            "validated_questions": questions,
+            "student_questions": student_questions,
+            "answers": [],
+            "pending_answers": [],
+            "evaluation_results": [],
+            "final_result": None,
+            "errors": [],
+            "trace": [],
+            "iteration_count": 0,
+            "retry_count": 0,
+            "_is_assignment": True,
+            "_assignment_id": assignment_id,
+            "_owner_email": user["email"],
+            "_owner_role": "teacher",
+            "_target_division": target_division,
+            "_subject": request.subject,
+            "_topic": request.topic,
+            "_difficulty": "Imported",
+            "_document_ids": [],
+            "exam_session": {
+                "session_id": assignment_id,
+                "exam_id": assignment_id,
+                "status": "assigned",
+                "total_questions": len(questions),
+                "answered_questions": 0,
+                "started_at": None,
+                "ends_at": None,
+            },
+        }
+
+        # Save assignment and imported questions in PostgreSQL.
+        with SessionLocal.begin() as db:
+            db.add(Exam(
+                id=assignment_id,
+                teacher_id=user["id"],
+                division=target_division,
+                subject=request.subject,
+                topic=request.topic or "",
+                difficulty="Imported",
+                status="assigned",
+                duration_minutes=request.duration_minutes,
+                scheduled_start_at=scheduled_start,
+                scheduled_end_at=scheduled_end,
+                generation_state=json.loads(
+                    json.dumps(result, default=str)
+                ),
+            ))
+
+            db.flush()
+            sync_state(db, result)
+
+        # Register assignment in existing session storage.
+        with sessions_lock:
+            sessions[assignment_id] = result
+
+        response = public_session(result)
+
+        response.update({
+            "session_id": assignment_id,
+            "assignment_id": assignment_id,
+            "division": target_division,
+            "subject": request.subject,
+            "topic": request.topic,
+            "difficulty": "Imported",
+            "status": "assigned",
+            "is_assignment": True,
+            "total_marks": total_marks,
+        })
+
+        return {
+            "message": "Imported examination created successfully.",
+            **response,
+        }
+
+    except HTTPException:
+        raise
+    except IntegrityError as exc:
+        raise HTTPException(
+            409,
+            "An examination with this identifier already exists"
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            500,
+            detail=f"Imported examination creation failed: {exc}"
+        ) from exc
+
 @app.post("/api/exams")
 def generate_exam(
     request: ExamRequest,
@@ -1217,7 +1390,7 @@ def list_teacher_exams(
                 "submitted_count": submitted,
                 "in_progress_count": in_progress,
                 "scheduled_end_at": scheduled_end_at,
-                "schedule_closed": schedule_closed, 
+                "schedule_closed": schedule_closed,
             })
 
             exams.append(exam)
@@ -1383,10 +1556,20 @@ def _create_student_attempt(
     attempt["final_result"] = None
 
     # Rebuild safe questions from the full generated questions.
+        # Rebuild safe questions from the full generated questions.
     attempt["student_questions"] = session_agent.get_questions(
         new_session,
         questions,
     )
+
+    # Preserve shared question-paper context for the student.
+    paper_context = assignment.get("paper_context")
+
+    if paper_context and attempt["student_questions"]:
+        attempt["student_questions"][0]["paper_context"] = paper_context
+
+    # Keep context in the student's attempt state as well.
+    attempt["paper_context"] = paper_context
 
     with SessionLocal.begin() as db:
         db.add(ExamAttempt(
@@ -1951,8 +2134,8 @@ def teacher_results(
             )
 
             session_data = state.get("exam_session") or {}
-            
-            
+
+
             # ----------------------------------------------
             # PROCTORING SUMMARY FOR THIS STUDENT ATTEMPT
             # ----------------------------------------------
@@ -1974,7 +2157,7 @@ def teacher_results(
                 )
             )
 
-            
+
             proctoring_details = [
                 {
                     "id": event.id,
@@ -2070,6 +2253,164 @@ def validate_note_file_header(
                 detail="TXT files must use UTF-8 encoding.",
             )
 
+# ============================================================
+# QUESTION PAPER UPLOAD AND TEXT EXTRACTION
+# ============================================================
+
+ALLOWED_QUESTION_PAPER_EXTENSIONS = {
+    ".pdf",
+    ".doc",
+    ".docx",
+}
+
+
+@app.post("/api/teacher/question-paper/preview")
+async def preview_question_paper(
+    file: UploadFile = File(...),
+    user: dict[str, Any] = Depends(require_role("teacher")),
+):
+    """
+    Temporarily upload an existing question paper,
+    extract its original text, and return it for review.
+
+    No AI question generation is performed.
+    No permanent local file is stored.
+    """
+
+    original_name = Path(file.filename or "").name
+    extension = Path(original_name).suffix.lower()
+
+    if not original_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid filename.",
+        )
+
+    if extension not in ALLOWED_QUESTION_PAPER_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail="Only PDF, DOC and DOCX files are supported.",
+        )
+
+    temp_path = None
+    total_size = 0
+    header = b""
+
+    try:
+        # Create temporary storage.
+        with tempfile.NamedTemporaryFile(
+            suffix=extension,
+            delete=False,
+        ) as temp_file:
+
+            temp_path = Path(temp_file.name)
+
+            # Read the uploaded file in chunks.
+            while True:
+                chunk = await file.read(1024 * 1024)
+
+                if not chunk:
+                    break
+
+                total_size += len(chunk)
+
+                if total_size > MAX_NOTE_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="File exceeds the 25 MB limit.",
+                    )
+
+                if len(header) < 16:
+                    header += chunk[:16 - len(header)]
+
+                temp_file.write(chunk)
+
+        if total_size == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file is empty.",
+            )
+
+        # Validate file signatures.
+        if extension == ".doc":
+
+            # Legacy Microsoft Word DOC uses OLE Compound File.
+            if not header.startswith(
+                bytes.fromhex("D0CF11E0A1B11AE1")
+            ):
+                raise HTTPException(
+                    status_code=415,
+                    detail="Invalid DOC file.",
+                )
+
+        else:
+            validate_note_file_header(
+                extension,
+                header,
+            )
+
+        # Extract the original document text.
+        extracted_text = extract_text(temp_path)
+
+        print("TABLE_START markers:", extracted_text.count("[[TABLE_START:"))
+        print("TABLE_END markers:", extracted_text.count("[[TABLE_END]]"))
+
+        if not extracted_text.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="No readable text was found in the question paper.",
+            )
+
+          # Extract shared instructions, database schemas and sample records.
+        try:
+            paper_context = extract_question_paper_context(extracted_text)
+
+            print("CONTEXT TABLE_START:", paper_context.count("[[TABLE_START:"))
+            print("CONTEXT TABLE_END:", paper_context.count("[[TABLE_END]]"))
+
+            question_text = re.sub(
+                r"\[\[TABLE_START:\d+\]\].*?\[\[TABLE_END\]\]",
+                "",
+                extracted_text,
+                flags=re.DOTALL,
+            )
+
+            parsed_questions = parse_questions(question_text)
+
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=str(exc),
+            ) from exc
+
+        return {
+            "message": "Question paper extracted successfully.",
+            "filename": original_name,
+            "file_type": extension.lstrip(".").upper(),
+            "file_size": total_size,
+            "extracted_text": extracted_text,
+            "character_count": len(extracted_text),
+            "paper_context": paper_context,
+
+            # Parsed questions
+            "questions": parsed_questions,
+            "question_count": len(parsed_questions),
+        }
+
+    except DocumentExtractionError as exc:
+
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+
+    finally:
+
+        await file.close()
+
+        # Delete the temporary file.
+        if temp_path and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
 
 # ============================================================
 # 1. UPLOAD PROFESSOR NOTES
